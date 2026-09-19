@@ -160,6 +160,14 @@ def training(
             gt_mask = torchvision.transforms.functional.to_tensor(gt_mask_pil).squeeze(0).to(image.device)
         
         rend_depth = render_pkg["rend_depth"].squeeze(0)  # (H, W)
+        if gt_mask.dim() == 3 and gt_mask.shape[0] == 1:
+            gt_mask = gt_mask.squeeze(0)
+        if gt_mask.shape[-2:] != rend_depth.shape[-2:]:
+            gt_mask = torch.nn.functional.interpolate(
+                gt_mask.unsqueeze(0).unsqueeze(0),
+                size=rend_depth.shape[-2:],
+                mode="nearest",
+            ).squeeze(0).squeeze(0)
         depth_mask = (gt_mask > 0) & (rend_depth > 0)
         if depth_mask.dim() == 3 and depth_mask.shape[0] == 1:
             depth_mask = depth_mask.squeeze(0)
