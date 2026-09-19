@@ -8,10 +8,10 @@ def get_pred_depth(dataset, viewpoints, res, depth_type="da3"):
     """
     Read depth for all viewpoints at once, store as tensor, return dict[image_name] = (H,W) CUDA tensor
     """
-    H, W = res
     gt_depths = {}
 
     for vp in viewpoints:
+        H, W = vp.image_height, vp.image_width
         img_name = getattr(vp, "image_name", str(getattr(vp, "colmap_id", "0")))
         colmap_id = getattr(vp, "colmap_id", None)
 
