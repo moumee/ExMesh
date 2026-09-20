@@ -988,7 +988,8 @@ def build_xatlas_samples(vertices, faces, active_face_indices, texture_size, pad
         for source_corner, vertex_id in enumerate(source_face):
             matches = np.where(geom_face == int(vertex_id))[0]
             if len(matches) != 1:
-                raise RuntimeError("Ambiguous xatlas corner mapping encountered.")
+                raise RuntimeError(
+                    "Ambiguous xatlas corner mapping encountered.")
             atlas_corner = int(matches[0])
             uv_index = int(uv_face[atlas_corner])
             face_uv_indices[source_fi, source_corner] = uv_index
@@ -1009,7 +1010,8 @@ def build_xatlas_samples(vertices, faces, active_face_indices, texture_size, pad
     pixel_parts = []
     valid_mask = np.zeros((texture_size, texture_size), dtype=bool)
 
-    print(f"[atlas:xatlas] rasterizing {len(faces):,} UV triangles...", flush=True)
+    print(
+        f"[atlas:xatlas] rasterizing {len(faces):,} UV triangles...", flush=True)
     total_samples = 0
     for fi, triangle_uv in enumerate(triangle_uvs):
         rows, cols, bary = rasterize_uv_triangle(triangle_uv, texture_size)
@@ -1019,8 +1021,10 @@ def build_xatlas_samples(vertices, faces, active_face_indices, texture_size, pad
         points = bary @ vertices[faces[fi]]
         point_parts.append(points.astype(np.float64, copy=False))
         bary_parts.append(bary.astype(np.float64, copy=False))
-        face_id_parts.append(np.full(len(rows), active_face_indices[fi], dtype=np.int64))
-        pixel_parts.append(np.column_stack((rows, cols)).astype(np.int32, copy=False))
+        face_id_parts.append(
+            np.full(len(rows), active_face_indices[fi], dtype=np.int64))
+        pixel_parts.append(np.column_stack(
+            (rows, cols)).astype(np.int32, copy=False))
         valid_mask[rows, cols] = True
         total_samples += len(rows)
 
@@ -1278,7 +1282,8 @@ def write_textured_obj(
 
     if uv_vertices is None or face_uv_indices is None:
         uv_vertices = triangle_uvs.reshape(-1, 2)
-        face_uv_indices = np.arange(len(faces) * 3, dtype=np.int64).reshape(-1, 3)
+        face_uv_indices = np.arange(
+            len(faces) * 3, dtype=np.int64).reshape(-1, 3)
 
     with open(path, "w", encoding="utf-8") as file:
         file.write(f"mtllib {mtl_path.name}\n")
@@ -1301,7 +1306,6 @@ def write_textured_obj(
                 f"{face[1] + 1}/{uv_face[1] + 1} "
                 f"{face[2] + 1}/{uv_face[2] + 1}\n"
             )
-
 
 
 # Optional Numba acceleration for numeric nested loops. First run includes JIT time.
@@ -1329,12 +1333,12 @@ def main():
     parser.add_argument("--ratio", type=float, default=0.5)
     parser.add_argument("--virtual_radius", type=float)
     parser.add_argument("--texture")
-    parser.add_argument("--texture_size", type=int, default=4096,
-                        help="Baked atlas resolution. Default: 4096")
+    parser.add_argument("--texture_size", type=int, default=1024,
+                        help="Baked atlas resolution. Default: 1024")
     parser.add_argument("--atlas", choices=("xatlas", "grid"), default="xatlas",
                         help="UV atlas mode. xatlas is recommended; grid is the old per-face layout.")
-    parser.add_argument("--texture_padding", type=int, default=8,
-                        help="Chart gutter in texels for xatlas and post-bake dilation. Default: 8")
+    parser.add_argument("--texture_padding", type=int, default=2,
+                        help="Chart gutter in texels for xatlas and post-bake dilation. Default: 2")
     args = parser.parse_args()
     run_started = time.perf_counter()
     if args.texture_size < 1:
