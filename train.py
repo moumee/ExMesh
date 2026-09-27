@@ -408,13 +408,13 @@ def training(
 
     magnitude_maps = []    # 시점별 정규화 전 Sobel 크기
     valid_masks = []       # 시점별 메시가 보이는 픽셀
-    triangle_id_maps = []  # 시점별 픽셀 → 삼각형 ID
+    face_id_maps = []  # 시점별 픽셀 → 삼각형 ID
 
     # 1. 입력 이미지의 Sobel 크기와 최종 메시의 삼각형 ID 계산
     with torch.no_grad():
         for camera in cameras:
             render_pkg = render(camera, mesh, pipe, background)
-            T_k = render_pkg["triangle_id"]  # (H, W), 배경은 -1
+            T_k = render_pkg["face_id"]  # (H, W), 배경은 -1
 
             # 실제 입력 이미지: (3, H, W) → (H, W, 3)
             image = camera.original_image[:3]
@@ -440,7 +440,7 @@ def training(
 
             magnitude_maps.append(g_k)
             valid_masks.append(valid_mask)
-            triangle_id_maps.append(T_k_np)
+            face_id_maps.append(T_k_np)
 
     # 2. 모든 시점의 유효 픽셀에서 공통 95백분위수 계산
     q = compute_global_percentile(
@@ -455,31 +455,53 @@ def training(
         for g_k in magnitude_maps
     ]
 
-    # 4. 픽셀 중요도를 삼각형별로 집계
-    importance = np.zeros(num_faces, dtype=np.float64)
+    # 4. 픽셀 중요도를 face별로 집계
+    # 각 face는 "실제로 보였던 view"에서만 평균을 냄
+    importance_sum = np.zeros(num_faces, dtype=np.float64)
+    visible_view_count = np.zeros(num_faces, dtype=np.int32)
 
-    for G_k, T_k in zip(feature_maps, triangle_id_maps):
+    for G_k, T_k in zip(feature_maps, face_id_maps):
         valid = T_k >= 0
 
         ids = T_k[valid]
         values = G_k[valid]
 
-        # 삼각형별 보이는 픽셀 개수
-        counts = np.bincount(ids, minlength=num_faces)
+        # 이 view에서 각 face가 차지한 픽셀 수
+        counts = np.bincount(
+            ids,
+            minlength=num_faces
+        )
 
-        # 삼각형별 픽셀 중요도 합
+        # 이 view에서 각 face에 대응되는 Sobel importance 합
         sums = np.bincount(
             ids,
             weights=values,
-            minlength=num_faces,
+            minlength=num_faces
         )
 
-        # 해당 시점의 삼각형별 평균 중요도
-        # 안 보이는 삼각형은 0 / 1 = 0
-        importance += sums / np.maximum(counts, 1)
+        # 이 view에서 실제로 관측된 face
+        visible = counts > 0
 
-    # 전체 카메라에 대한 평균
-    importance /= len(cameras)
+        # 이 view에서의 face별 평균 Sobel importance
+        view_importance = np.zeros(num_faces, dtype=np.float64)
+        view_importance[visible] = (
+            sums[visible] / counts[visible]
+        )
+
+        # 관측된 face만 누적
+        importance_sum[visible] += view_importance[visible]
+        visible_view_count[visible] += 1
+
+    # 각 face가 실제로 관측된 view 수로 평균
+    importance = np.zeros(num_faces, dtype=np.float64)
+
+    visible_faces = visible_view_count > 0
+
+    importance[visible_faces] = (
+        importance_sum[visible_faces]
+        / visible_view_count[visible_faces]
+    )
+
     importance = importance.astype(np.float32)
 
     # 5. Wild에서 읽을 수 있도록 저장
