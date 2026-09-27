@@ -148,5 +148,10 @@ def render(viewpoint_camera, mesh, pipe, bg_color: torch.Tensor):
         "rend_normal": rend_normal,    # (3,H,W)
         "rend_depth": phys_depth,      # (1,H,W) 
         "scaling": image_size,
+        # [Added by moumee]
+        # rast is (B, W, H, 4) where B is number of batches, and the 4 consisted of (u, v, z/w, triangle ID)
+        # Therefore, since we only have one camera, we only have 1 batch, and we need the triangle id.
+        # We use 'long()' function to convert the id to torch.int64 and subtract 1 to make the background -1.
+        "face_id": rast[0, ..., 3].long() - 1 
     }
  

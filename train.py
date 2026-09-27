@@ -4,7 +4,7 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
-# This software is free for non-commercial, research and evaluation use 
+# This software is free for non-commercial, research and evaluation use
 # under the terms of the LICENSE_GS.md file.
 #
 # For inquiries contact george.drettakis@inria.fr
@@ -49,22 +49,29 @@ from PIL import Image
 import numpy as np
 import cv2
 
+from moumee.moumee_img_utils import (
+    compute_global_percentile,
+    compute_sobel_magnitude,
+    normalize_magnitude
+)
+
 
 def training(
-    dataset,   
-    opt, 
+    dataset,
+    opt,
     pipe,
     testing_iterations,
     save_iterations,
-    checkpoint, 
+    checkpoint,
     debug_from,
-    ):
+):
     first_iter = 0
     # Prepare output directories and TensorBoard logger
     tb_writer = prepare_output_and_logger(dataset)
     # Set background color
     bg_color = 1 if dataset.white_background else 0
-    background = torch.tensor([bg_color, bg_color, bg_color], dtype=torch.float32, device="cuda")
+    background = torch.tensor(
+        [bg_color, bg_color, bg_color], dtype=torch.float32, device="cuda")
 
     # Load mesh model and scene
     mesh = MeshModel(dataset.sh_degree)
@@ -76,7 +83,7 @@ def training(
     save_path = os.path.join(save_uvmap_dir, "uvmap_init.png")
     torchvision.utils.save_image(uvmap, save_path)
     print(f"Initial uv map has been saved to: {save_path}")
-    
+
     # Setup optimizer and learning rate
     mesh.training_setup(opt, opt.feature_lr, opt.lr_vertices_init)
 
@@ -86,13 +93,14 @@ def training(
         mesh.restore(model_params, opt)
 
     # CUDA timers for iteration timing
-    iter_start = torch.cuda.Event(enable_timing = True)
-    iter_end = torch.cuda.Event(enable_timing = True)
+    iter_start = torch.cuda.Event(enable_timing=True)
+    iter_end = torch.cuda.Event(enable_timing=True)
 
     # Get all training camera views
     viewpoint_stack = scene.getTrainCameras().copy()
     H, W = viewpoint_stack[0].image_height, viewpoint_stack[0].image_width
-    gt_depths = get_pred_depth(dataset, viewpoint_stack, (H,W), depth_type='da3')
+    gt_depths = get_pred_depth(
+        dataset, viewpoint_stack, (H, W), depth_type='da3')
 
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training")
@@ -104,11 +112,12 @@ def training(
     loss_fn = l1_loss
 
     # Save initial mesh
-    auto_ply_path = os.path.join(dataset.model_path, "mesh", f"auto_mesh_iter_0.ply")
+    auto_ply_path = os.path.join(
+        dataset.model_path, "mesh", f"auto_mesh_iter_0.ply")
     save_mesh_dir = os.path.join(dataset.model_path, "mesh")
     os.makedirs(save_mesh_dir, exist_ok=True)
     mesh.save_as_ply(auto_ply_path)
-    
+
     # Initialize EMA vertex reference
     mesh.vertices_ref = mesh.get_vertices.detach().clone()
 
@@ -136,10 +145,11 @@ def training(
             pipe.debug = True
 
         # Use random or fixed background
-        bg = torch.rand((3), device="cuda") if opt.random_background else background
+        bg = torch.rand(
+            (3), device="cuda") if opt.random_background else background
         render_pkg = render(viewpoint_cam, mesh, pipe, bg)
         image = render_pkg["render"]
-        
+
         # Triangle projection stats
         image_size = render_pkg["scaling"].detach()
 
@@ -149,34 +159,40 @@ def training(
 
         # Compute losses
         gt_image = viewpoint_cam.original_image.cuda()
-        train_bg = torch.tensor([bg_color, bg_color, bg_color], dtype=torch.float32, device="cuda").view(3, 1, 1).expand_as(gt_image)
+        train_bg = torch.tensor([bg_color, bg_color, bg_color], dtype=torch.float32, device="cuda").view(
+            3, 1, 1).expand_as(gt_image)
         if viewpoint_cam.gt_alpha_mask is not None:
             gt_mask = viewpoint_cam.gt_alpha_mask.cuda()
             gt_image = gt_image * gt_mask + train_bg * (1 - gt_mask)
         else:
             img_name = viewpoint_cam.image_name
-            mask_path = os.path.join(dataset.source_path, "train_mask", f"{img_name}_gtmask.png")
+            mask_path = os.path.join(
+                dataset.source_path, "train_mask", f"{img_name}_gtmask.png")
             gt_mask_pil = Image.open(mask_path).convert("L")
-            gt_mask = torchvision.transforms.functional.to_tensor(gt_mask_pil).squeeze(0).to(image.device)
-        
+            gt_mask = torchvision.transforms.functional.to_tensor(
+                gt_mask_pil).squeeze(0).to(image.device)
+
         rend_depth = render_pkg["rend_depth"].squeeze(0)  # (H, W)
         depth_mask = (gt_mask > 0) & (rend_depth > 0)
         if depth_mask.dim() == 3 and depth_mask.shape[0] == 1:
             depth_mask = depth_mask.squeeze(0)
         gt_depth = gt_depths[viewpoint_cam.image_name]
-        
+
         # Pearson correlation depth loss
-        depth_loss, depth_contrib = pearson_correlation_loss(rend_depth, gt_depth, depth_mask)
+        depth_loss, depth_contrib = pearson_correlation_loss(
+            rend_depth, gt_depth, depth_mask)
         depth_loss = depth_loss * opt.lambda_depth
-        
+
         pixel_loss = loss_fn(image, gt_image)
         # Composite pixel loss (L1/L2 + SSIM)
-        loss_image = (1.0 - opt.lambda_dssim) * pixel_loss + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+        loss_image = (1.0 - opt.lambda_dssim) * pixel_loss + \
+            opt.lambda_dssim * (1.0 - ssim(image, gt_image))
 
         # Silhouette loss
         pred_mask = render_pkg["rend_alpha"].squeeze(0)  # (H,W)
-        silhouette_loss = silhouette_bce_loss(pred_mask, gt_mask) * opt.lambda_silhouette
-        rend_normal  = render_pkg['rend_normal']
+        silhouette_loss = silhouette_bce_loss(
+            pred_mask, gt_mask) * opt.lambda_silhouette
+        rend_normal = render_pkg['rend_normal']
 
         if iteration < opt.split_from_iter:
             silhouette_loss.backward(retain_graph=True)
@@ -185,18 +201,20 @@ def training(
                 mesh.mask_grad_ema += mask_grad_intensity
             mesh._vertices.grad = None
             mesh._texture.grad = None
-            
+
         # Laplacian smooth loss
-        smooth_loss1 = laplacian_smooth_loss(mesh.get_vertices, mesh.get_faces) * opt.lambda_smooth
+        smooth_loss1 = laplacian_smooth_loss(
+            mesh.get_vertices, mesh.get_faces) * opt.lambda_smooth
         smooth_loss = smooth_loss1
-        deviation_loss = double_vertex_deviation_loss(mesh.get_vertices, mesh.vertices_ref, mesh.get_faces) * opt.lambda_deviation
+        deviation_loss = double_vertex_deviation_loss(
+            mesh.get_vertices, mesh.vertices_ref, mesh.get_faces) * opt.lambda_deviation
 
         # Total loss
         loss = loss_image + smooth_loss + deviation_loss + silhouette_loss + depth_loss
 
         loss.backward()
         iter_end.record()
-        
+
         with torch.no_grad():
             # Update progress bar and log loss
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
@@ -215,15 +233,18 @@ def training(
                 progress_bar.close()
 
             # Logging and model saving
-            training_report(tb_writer, iteration, pixel_loss, loss, loss_fn, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
+            training_report(tb_writer, iteration, pixel_loss, loss, loss_fn, iter_start.elapsed_time(
+                iter_end), testing_iterations, scene, render, (pipe, background))
             if iteration in save_iterations:
                 print("\n[ITER {}] Saving Triangles".format(iteration))
                 scene.save(iteration)
 
             if iteration == 1:
                 # Initial vertex merge and UV map recreation
-                vertex_colors = uvmap_to_vertex_color(mesh._vertices, mesh._uvs, mesh._texture, mesh._vmapping, mesh._texture_mask)
-                mesh._vertices_color = torch.tensor(vertex_colors, dtype=torch.float32, device="cuda")
+                vertex_colors = uvmap_to_vertex_color(
+                    mesh._vertices, mesh._uvs, mesh._texture, mesh._vmapping, mesh._texture_mask)
+                mesh._vertices_color = torch.tensor(
+                    vertex_colors, dtype=torch.float32, device="cuda")
                 areas = mesh.compute_face_areas()
                 area_thr = torch.quantile(areas, 0.1)
                 for i in range(10):
@@ -236,42 +257,56 @@ def training(
                 mesh.recreate_uvmap(bg_color=bg_color)
                 mesh._reset_optimizer()
                 mesh.vertices_ref = mesh.get_vertices.detach().clone()
-                mesh.mask_grad_ema = torch.zeros(mesh._vertices.shape[0], device="cuda")
+                mesh.mask_grad_ema = torch.zeros(
+                    mesh._vertices.shape[0], device="cuda")
                 removed_them = True
                 new_round = False
 
             # Prune boundary vertices by area and mask_grad_ema
             if iteration % opt.densification_interval == 0 and iteration < opt.split_from_iter:
-                vertex_colors = uvmap_to_vertex_color(mesh._vertices, mesh._uvs, mesh._texture, mesh._vmapping, mesh._texture_mask)
-                mesh._vertices_color = torch.tensor(vertex_colors, dtype=torch.float32, device="cuda")
-                dead_mask = mesh.compute_boundary_dead_mask(grad_percent=0.2, area_percent=0.2, white_thresh=0.995, grad_thresh=1e-8, bg_color=bg_color)  # (V,)
+                vertex_colors = uvmap_to_vertex_color(
+                    mesh._vertices, mesh._uvs, mesh._texture, mesh._vmapping, mesh._texture_mask)
+                mesh._vertices_color = torch.tensor(
+                    vertex_colors, dtype=torch.float32, device="cuda")
+                dead_mask = mesh.compute_boundary_dead_mask(
+                    # (V,)
+                    grad_percent=0.2, area_percent=0.2, white_thresh=0.995, grad_thresh=1e-8, bg_color=bg_color)
                 mesh.prune_boundary_vertices(dead_mask, n_rounds=5)
                 mesh.vertices_ref = mesh.get_vertices.detach().clone()
                 # reset mask_grad_ema
-                mesh.mask_grad_ema = torch.zeros(mesh._vertices.shape[0], device="cuda")
+                mesh.mask_grad_ema = torch.zeros(
+                    mesh._vertices.shape[0], device="cuda")
                 removed_them = True
                 new_round = False
 
             # Vertex split and merge
             elif iteration >= opt.split_from_iter and iteration % opt.densification_interval == 0 and iteration <= opt.split_until_iter:
-                vertex_colors = uvmap_to_vertex_color(mesh._vertices, mesh._uvs, mesh._texture, mesh._vmapping, mesh._texture_mask)
-                mesh._vertices_color = torch.tensor(vertex_colors, dtype=torch.float32, device="cuda")
+                vertex_colors = uvmap_to_vertex_color(
+                    mesh._vertices, mesh._uvs, mesh._texture, mesh._vmapping, mesh._texture_mask)
+                mesh._vertices_color = torch.tensor(
+                    vertex_colors, dtype=torch.float32, device="cuda")
                 if iteration == 1000:
                     # Extra boundary pruning at iter 1000
-                    dead_mask = mesh.compute_boundary_dead_mask(grad_percent=0.2, area_percent=0.2, white_thresh=0.995, grad_thresh=1e-8, bg_color=bg_color)
+                    dead_mask = mesh.compute_boundary_dead_mask(
+                        grad_percent=0.2, area_percent=0.2, white_thresh=0.995, grad_thresh=1e-8, bg_color=bg_color)
                     mesh.prune_boundary_vertices(dead_mask, n_rounds=5)
-                dead_mask = mesh.compute_dead_mask(image_size_thresh=10, degeneracy_thresh=opt.degeneracy_threshold*2, area_percent=0.5)
+                dead_mask = mesh.compute_dead_mask(
+                    image_size_thresh=10, degeneracy_thresh=opt.degeneracy_threshold*2, area_percent=0.5)
                 mesh.add_new_face(cap_max=opt.max_shapes, dead_mask=dead_mask)
                 if iteration % (opt.densification_interval * 4) == 0:
                     # Vertex merge every 2000 iterations
-                    dead_mask = mesh.compute_boundary_dead_mask(grad_percent=0.2, area_percent=0.2, white_thresh=0.995, grad_thresh=1e-8, bg_color=bg_color)
+                    dead_mask = mesh.compute_boundary_dead_mask(
+                        grad_percent=0.2, area_percent=0.2, white_thresh=0.995, grad_thresh=1e-8, bg_color=bg_color)
                     mesh.prune_boundary_vertices(dead_mask, n_rounds=2)
                     for i in range(5):
-                        dead_mask = mesh.compute_dead_mask(image_size_thresh=0, degeneracy_thresh=opt.degeneracy_threshold, area_percent=0.3)
-                        mesh.merge_close_vertex(dead_mask, length_ratio_thresh=0.2)
+                        dead_mask = mesh.compute_dead_mask(
+                            image_size_thresh=0, degeneracy_thresh=opt.degeneracy_threshold, area_percent=0.3)
+                        mesh.merge_close_vertex(
+                            dead_mask, length_ratio_thresh=0.2)
                 removed_them = True
                 new_round = False
-                mesh.image_size = torch.zeros(mesh.get_faces.shape[0], device="cuda")
+                mesh.image_size = torch.zeros(
+                    mesh.get_faces.shape[0], device="cuda")
                 # Reset EMA reference after topology change
                 mesh.vertices_ref = mesh.get_vertices.detach().clone()
 
@@ -284,82 +319,194 @@ def training(
             # Optimizer step and zero gradients
             if iteration < opt.iterations:
                 mesh.optimizer.step()
-                mesh.optimizer.zero_grad(set_to_none = True)
+                mesh.optimizer.zero_grad(set_to_none=True)
                 # EMA update for reference vertices
                 beta = getattr(opt, "smooth_ref_ema", 0.99)
-                mesh.vertices_ref.mul_(beta).add_((1.0 - beta) * mesh.get_vertices.detach())
+                mesh.vertices_ref.mul_(beta).add_(
+                    (1.0 - beta) * mesh.get_vertices.detach())
         # Save mesh and images at intervals
         if (iteration == 1) or (iteration <= 4000 and iteration % 500 == 499) or (iteration <= 4000 and iteration % 500 == 0) or (iteration > 4000 and iteration % 1000 == 999) or (iteration > 4000 and iteration % 1000 == 0):
-            auto_ply_path = os.path.join(dataset.model_path, "mesh", f"auto_mesh_iter_{iteration}.ply")
+            auto_ply_path = os.path.join(
+                dataset.model_path, "mesh", f"auto_mesh_iter_{iteration}.ply")
             mesh.save_as_ply(auto_ply_path)
             save_img_dir = os.path.join(dataset.model_path, "render_images")
             os.makedirs(save_img_dir, exist_ok=True)
             # Save UV map
             save_uvmap_dir = os.path.join(dataset.model_path, "uvmap")
             uvmap = mesh.get_texture.detach().cpu().clamp(0, 1)  # (3, H, W)
-            save_path = os.path.join(save_uvmap_dir, f"iter_{iteration}_uvmap.png")
+            save_path = os.path.join(
+                save_uvmap_dir, f"iter_{iteration}_uvmap.png")
             torchvision.utils.save_image(uvmap, save_path)
-            
+
             # Save GT and rendered RGB images
-            gt_img_np = (gt_image.permute(1,2,0).clamp(0,1).detach().cpu().numpy() * 255).astype(np.uint8)
-            render_img_np = (image.permute(1,2,0).clamp(0,1).detach().cpu().numpy() * 255).astype(np.uint8)
-            gt_img_show = gt_img_np[:, :, [2,1,0]]
-            render_img_show = render_img_np[:, :, [2,1,0]]
+            gt_img_np = (gt_image.permute(1, 2, 0).clamp(
+                0, 1).detach().cpu().numpy() * 255).astype(np.uint8)
+            render_img_np = (image.permute(1, 2, 0).clamp(
+                0, 1).detach().cpu().numpy() * 255).astype(np.uint8)
+            gt_img_show = gt_img_np[:, :, [2, 1, 0]]
+            render_img_show = render_img_np[:, :, [2, 1, 0]]
 
             # Save normal maps
             rend_normal = render_pkg['rend_normal']  # (3,H,W)
-            rend_normal_np = ((rend_normal.permute(1,2,0) * 0.5 + 0.5).clamp(0,1).detach().cpu().numpy() * 255).astype(np.uint8)
-            rend_normal_show = rend_normal_np[:, :, [2,1,0]]
+            rend_normal_np = ((rend_normal.permute(
+                1, 2, 0) * 0.5 + 0.5).clamp(0, 1).detach().cpu().numpy() * 255).astype(np.uint8)
+            rend_normal_show = rend_normal_np[:, :, [2, 1, 0]]
 
             # Save depth maps (grayscale)
-            rend_depth_full = render_pkg["rend_depth"].squeeze(0).detach().cpu().numpy()  # (H,W)
+            rend_depth_full = render_pkg["rend_depth"].squeeze(
+                0).detach().cpu().numpy()  # (H,W)
             gt_depth_np = gt_depth.detach().cpu().numpy()
             depth_mask_np = (depth_mask.detach().cpu().numpy())
             depth_vis = np.zeros_like(rend_depth_full, dtype=np.float32)
             rd = rend_depth_full[depth_mask_np]
-            depth_vis[depth_mask_np] = (rd - rd.min()) / (rd.max() - rd.min() + 1e-8)
+            depth_vis[depth_mask_np] = (
+                rd - rd.min()) / (rd.max() - rd.min() + 1e-8)
             rend_depth_gray_u8 = (depth_vis * 255).astype(np.uint8)
-            rend_depth_gray_color = cv2.cvtColor(rend_depth_gray_u8, cv2.COLOR_GRAY2BGR)
+            rend_depth_gray_color = cv2.cvtColor(
+                rend_depth_gray_u8, cv2.COLOR_GRAY2BGR)
             gt_depth_vis = np.zeros_like(gt_depth_np, dtype=np.float32)
             gd = gt_depth_np[depth_mask_np]
-            gt_depth_vis[depth_mask_np] = (gd - gd.min()) / (gd.max() - gd.min() + 1e-8)
+            gt_depth_vis[depth_mask_np] = (
+                gd - gd.min()) / (gd.max() - gd.min() + 1e-8)
             gt_depth_gray_u8 = (gt_depth_vis * 255).astype(np.uint8)
-            gt_depth_gray_color = cv2.cvtColor(gt_depth_gray_u8, cv2.COLOR_GRAY2BGR)
+            gt_depth_gray_color = cv2.cvtColor(
+                gt_depth_gray_u8, cv2.COLOR_GRAY2BGR)
 
             # Save depth contribution (colormap)
             contrib_np = depth_contrib.detach().cpu().numpy()  # (H,W)
             contrib_vis = np.zeros_like(contrib_np, dtype=np.float32)
             cv = contrib_np[depth_mask_np]
-            contrib_vis[depth_mask_np] = (cv - cv.min()) / (cv.max() - cv.min() + 1e-8)
+            contrib_vis[depth_mask_np] = (
+                cv - cv.min()) / (cv.max() - cv.min() + 1e-8)
             contrib_u8 = (contrib_vis * 255).astype(np.uint8)
             contrib_color = cv2.applyColorMap(contrib_u8, cv2.COLORMAP_JET)
 
             # Save mask difference (colormap)
-            mask_diff = torch.abs(pred_mask.detach().cpu() - gt_mask.detach().cpu())
+            mask_diff = torch.abs(
+                pred_mask.detach().cpu() - gt_mask.detach().cpu())
             mask_diff_img = (mask_diff.numpy() * 255).astype(np.uint8)
             if mask_diff_img.ndim == 3:
                 mask_diff_img = mask_diff_img.squeeze()
-            mask_diff_color = cv2.applyColorMap(mask_diff_img, cv2.COLORMAP_JET)
-            
-            row0 = np.concatenate([gt_img_show, render_img_show, rend_normal_show, rend_normal_show], axis=1)
-            row1 = np.concatenate([rend_depth_gray_color, gt_depth_gray_color, contrib_color, mask_diff_color], axis=1)
+            mask_diff_color = cv2.applyColorMap(
+                mask_diff_img, cv2.COLORMAP_JET)
+
+            row0 = np.concatenate(
+                [gt_img_show, render_img_show, rend_normal_show, rend_normal_show], axis=1)
+            row1 = np.concatenate(
+                [rend_depth_gray_color, gt_depth_gray_color, contrib_color, mask_diff_color], axis=1)
             image_to_show = np.concatenate([row0, row1], axis=0)
-            debug_path = os.path.join(save_img_dir, f"iter_{iteration}_panel.jpg")
+            debug_path = os.path.join(
+                save_img_dir, f"iter_{iteration}_panel.jpg")
             cv2.imwrite(debug_path, image_to_show)
-        
+
+    # 학습 완료 후, 최종 메시로 중요도 계산
+    cameras = list(scene.getTrainCameras())
+    num_faces = mesh.get_faces.shape[0]
+
+    if len(cameras) == 0:
+        raise ValueError("중요도를 계산할 카메라가 없습니다.")
+
+    magnitude_maps = []    # 시점별 정규화 전 Sobel 크기
+    valid_masks = []       # 시점별 메시가 보이는 픽셀
+    triangle_id_maps = []  # 시점별 픽셀 → 삼각형 ID
+
+    # 1. 입력 이미지의 Sobel 크기와 최종 메시의 삼각형 ID 계산
+    with torch.no_grad():
+        for camera in cameras:
+            render_pkg = render(camera, mesh, pipe, background)
+            T_k = render_pkg["triangle_id"]  # (H, W), 배경은 -1
+
+            # 실제 입력 이미지: (3, H, W) → (H, W, 3)
+            image = camera.original_image[:3]
+            image_np = (
+                image.detach()
+                .cpu()
+                .permute(1, 2, 0)
+                .numpy()
+            )
+
+            # Gaussian smoothing + Sobel
+            g_k = compute_sobel_magnitude(image_np)
+
+            # 이후 NumPy로 처리
+            T_k_np = T_k.cpu().numpy()
+            valid_mask = T_k_np >= 0
+
+            if g_k.shape != T_k_np.shape:
+                raise ValueError(
+                    f"영상과 ID 맵 크기가 다릅니다: "
+                    f"{g_k.shape} vs {T_k_np.shape}"
+                )
+
+            magnitude_maps.append(g_k)
+            valid_masks.append(valid_mask)
+            triangle_id_maps.append(T_k_np)
+
+    # 2. 모든 시점의 유효 픽셀에서 공통 95백분위수 계산
+    q = compute_global_percentile(
+        magnitude_maps,
+        valid_masks,
+        percentile=95,
+    )
+
+    # 3. 공통 기준으로 각 시점의 Sobel 크기를 [0, 1]로 정규화
+    feature_maps = [
+        normalize_magnitude(g_k, q)
+        for g_k in magnitude_maps
+    ]
+
+    # 4. 픽셀 중요도를 삼각형별로 집계
+    importance = np.zeros(num_faces, dtype=np.float64)
+
+    for G_k, T_k in zip(feature_maps, triangle_id_maps):
+        valid = T_k >= 0
+
+        ids = T_k[valid]
+        values = G_k[valid]
+
+        # 삼각형별 보이는 픽셀 개수
+        counts = np.bincount(ids, minlength=num_faces)
+
+        # 삼각형별 픽셀 중요도 합
+        sums = np.bincount(
+            ids,
+            weights=values,
+            minlength=num_faces,
+        )
+
+        # 해당 시점의 삼각형별 평균 중요도
+        # 안 보이는 삼각형은 0 / 1 = 0
+        importance += sums / np.maximum(counts, 1)
+
+    # 전체 카메라에 대한 평균
+    importance /= len(cameras)
+    importance = importance.astype(np.float32)
+
+    # 5. Wild에서 읽을 수 있도록 저장
+    save_path = os.path.join(
+        dataset.model_path,
+        "face_importance.npy",
+    )
+    np.save(save_path, importance)
+
+    print(f"Face importance saved: {save_path}")
+    print(f"Number of faces: {num_faces}")
+    print(f"Global Sobel P95: {q}")
+
     print("Training is done")
 
-def prepare_output_and_logger(args):    
+
+def prepare_output_and_logger(args):
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
-            unique_str=os.getenv('OAR_JOB_ID')
+            unique_str = os.getenv('OAR_JOB_ID')
         else:
             unique_str = str(uuid.uuid4())
         args.model_path = os.path.join("./output/", unique_str[0:10])
-        
+
     # Set up output folder
     print("Output folder: {}".format(args.model_path))
-    os.makedirs(args.model_path, exist_ok = True)
+    os.makedirs(args.model_path, exist_ok=True)
     with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
         cfg_log_f.write(str(Namespace(**vars(args))))
 
@@ -371,17 +518,20 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, pixel_loss, loss, loss_fn, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
+
+def training_report(tb_writer, iteration, pixel_loss, loss, loss_fn, elapsed, testing_iterations, scene: Scene, renderFunc, renderArgs):
     if tb_writer:
-        tb_writer.add_scalar('train_loss_patches/pixel_loss', pixel_loss.item(), iteration)
-        tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
+        tb_writer.add_scalar('train_loss_patches/pixel_loss',
+                             pixel_loss.item(), iteration)
+        tb_writer.add_scalar(
+            'train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
 
     # Report test and samples of training set
     if iteration in testing_iterations:
         torch.cuda.empty_cache()
-        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
-                              {'name': 'train', 'cameras' : scene.getTrainCameras()})
+        validation_configs = ({'name': 'test', 'cameras': scene.getTestCameras()},
+                              {'name': 'train', 'cameras': scene.getTrainCameras()})
 
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
@@ -390,72 +540,96 @@ def training_report(tb_writer, iteration, pixel_loss, loss, loss_fn, elapsed, te
                 ssim_test = 0.0
                 lpips_test = 0.0
                 total_time = 0.0
-                
-                save_dir = os.path.join(scene.model_path, f"test_render_iter_{iteration}")
+
+                save_dir = os.path.join(
+                    scene.model_path, f"test_render_iter_{iteration}")
                 os.makedirs(save_dir, exist_ok=True)
 
                 for idx, viewpoint in enumerate(config['cameras']):
                     start_event = torch.cuda.Event(enable_timing=True)
                     end_event = torch.cuda.Event(enable_timing=True)
                     start_event.record()
-                    image = torch.clamp(renderFunc(viewpoint, scene.mesh, *renderArgs)["render"], 0.0, 1.0)
+                    image = torch.clamp(renderFunc(
+                        viewpoint, scene.mesh, *renderArgs)["render"], 0.0, 1.0)
                     end_event.record()
                     torch.cuda.synchronize()
                     runtime = start_event.elapsed_time(end_event)
                     total_time += runtime
 
-                    gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+                    gt_image = torch.clamp(
+                        viewpoint.original_image.to("cuda"), 0.0, 1.0)
                     if viewpoint.gt_alpha_mask is not None:
                         gt_mask = viewpoint.gt_alpha_mask.cuda()
-                        train_bg = torch.tensor([0,0,0], dtype=torch.float32, device="cuda").view(3, 1, 1).expand_as(gt_image)
-                        gt_image = gt_image * gt_mask + train_bg * (1 - gt_mask)
-                    
+                        train_bg = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda").view(
+                            3, 1, 1).expand_as(gt_image)
+                        gt_image = gt_image * gt_mask + \
+                            train_bg * (1 - gt_mask)
+
                     img_name = getattr(viewpoint, "image_name", str(idx))
-                    save_render_path = os.path.join(save_dir, f"{config['name']}_{img_name}_render.png")
-                    save_gt_path = os.path.join(save_dir, f"{config['name']}_{img_name}_gt.png")
-                    torchvision.utils.save_image(image.detach().cpu(), save_render_path)
-                    torchvision.utils.save_image(gt_image.detach().cpu(), save_gt_path)
-                    
-                    rend_normal = renderFunc(viewpoint, scene.mesh, *renderArgs)["rend_normal"]
-                    rend_normal_write = rend_normal.permute(1,2,0) * 0.5 + 0.5 
-                    normal_path = os.path.join(save_dir, f"{config['name']}_{img_name}_rend_normal.png")
-                    torchvision.utils.save_image(rend_normal_write.permute(2,0,1).detach().cpu(), normal_path)
-                    
-                    rend_depth = renderFunc(viewpoint, scene.mesh, *renderArgs)["rend_depth"]
+                    save_render_path = os.path.join(
+                        save_dir, f"{config['name']}_{img_name}_render.png")
+                    save_gt_path = os.path.join(
+                        save_dir, f"{config['name']}_{img_name}_gt.png")
+                    torchvision.utils.save_image(
+                        image.detach().cpu(), save_render_path)
+                    torchvision.utils.save_image(
+                        gt_image.detach().cpu(), save_gt_path)
+
+                    rend_normal = renderFunc(
+                        viewpoint, scene.mesh, *renderArgs)["rend_normal"]
+                    rend_normal_write = rend_normal.permute(
+                        1, 2, 0) * 0.5 + 0.5
+                    normal_path = os.path.join(
+                        save_dir, f"{config['name']}_{img_name}_rend_normal.png")
+                    torchvision.utils.save_image(rend_normal_write.permute(
+                        2, 0, 1).detach().cpu(), normal_path)
+
+                    rend_depth = renderFunc(
+                        viewpoint, scene.mesh, *renderArgs)["rend_depth"]
                     rend_depth_img = rend_depth.squeeze(0).detach().cpu()
                     fg_mask = rend_depth_img > 0
                     rend_depth_vis = torch.zeros_like(rend_depth_img)
                     if fg_mask.any():
                         min_val = rend_depth_img[fg_mask].min()
                         max_val = rend_depth_img[fg_mask].max()
-                        rend_depth_vis[fg_mask] = (rend_depth_img[fg_mask] - min_val) / (max_val - min_val + 1e-8)
+                        rend_depth_vis[fg_mask] = (
+                            rend_depth_img[fg_mask] - min_val) / (max_val - min_val + 1e-8)
                     rend_depth_vis = rend_depth_vis.clamp(0, 1)
-                    rend_depth_path = os.path.join(save_dir, f"{config['name']}_{img_name}_rend_depth.png")
-                    torchvision.utils.save_image(rend_depth_vis.unsqueeze(0), rend_depth_path)
+                    rend_depth_path = os.path.join(
+                        save_dir, f"{config['name']}_{img_name}_rend_depth.png")
+                    torchvision.utils.save_image(
+                        rend_depth_vis.unsqueeze(0), rend_depth_path)
 
                     if tb_writer and (idx < 5):
-                        tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
+                        tb_writer.add_images(config['name'] + "_view_{}/render".format(
+                            viewpoint.image_name), image[None], global_step=iteration)
                         if iteration == testing_iterations[0]:
-                            tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
+                            tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(
+                                viewpoint.image_name), gt_image[None], global_step=iteration)
                     pixel_loss_test += loss_fn(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
                     ssim_test += ssim(image, gt_image).mean().double()
                     lpips_test += lpips_fn(image, gt_image).mean().double()
                 psnr_test /= len(config['cameras'])
-                pixel_loss_test /= len(config['cameras'])       
+                pixel_loss_test /= len(config['cameras'])
                 ssim_test /= len(config['cameras'])
-                lpips_test /= len(config['cameras'])  
+                lpips_test /= len(config['cameras'])
                 total_time /= len(config['cameras'])
-                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {} SSIM {} LPIPS {}".format(iteration, config['name'], pixel_loss_test, psnr_test, ssim_test, lpips_test))
+                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {} SSIM {} LPIPS {}".format(
+                    iteration, config['name'], pixel_loss_test, psnr_test, ssim_test, lpips_test))
 
                 if tb_writer:
-                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', pixel_loss_test, iteration)
-                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
+                    tb_writer.add_scalar(
+                        config['name'] + '/loss_viewpoint - l1_loss', pixel_loss_test, iteration)
+                    tb_writer.add_scalar(
+                        config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
 
         if tb_writer:
-            #tb_writer.add_histogram("scene/opacity_histogram", scene.triangles.get_opacity, iteration)
-            tb_writer.add_scalar('total_points', scene.mesh.get_vertices.shape[0], iteration)
+            # tb_writer.add_histogram("scene/opacity_histogram", scene.triangles.get_opacity, iteration)
+            tb_writer.add_scalar(
+                'total_points', scene.mesh.get_vertices.shape[0], iteration)
         torch.cuda.empty_cache()
+
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -468,12 +642,13 @@ if __name__ == "__main__":
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[-1])
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[-1])
     parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
-    parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--checkpoint_iterations",
+                        nargs="+", type=int, default=[])
+    parser.add_argument("--start_checkpoint", type=str, default=None)
 
     parser.add_argument("--no_dome", action="store_true", default=False)
     parser.add_argument("--outdoor", action="store_true", default=False)
-    
+
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
 
@@ -500,6 +675,6 @@ if __name__ == "__main__":
              args.start_checkpoint,
              args.debug_from,
              )
-    
+
     # All done
     print("\nTraining complete.")
