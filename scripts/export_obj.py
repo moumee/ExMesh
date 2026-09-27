@@ -26,7 +26,7 @@ def export_obj(mesh, export_dir, name="mesh"):
 
     obj_path = os.path.join(export_dir, f"{name}.obj")
     mtl_path = os.path.join(export_dir, f"{name}.mtl")
-    texture_path = os.path.join(export_dir, f"{name}_texture.png")
+    texture_path = os.path.join(export_dir, f"{name}.png")
 
     # -----------------------------------------------------
     # Mesh data
@@ -88,7 +88,7 @@ def export_obj(mesh, export_dir, name="mesh"):
         f.write("Ks 0.000000 0.000000 0.000000\n")
         f.write("d 1.0\n")
         f.write("illum 1\n")
-        f.write(f"map_Kd {name}_texture.png\n")
+        f.write(f"map_Kd {name}.png\n")
 
     # -----------------------------------------------------
     # OBJ
@@ -163,6 +163,16 @@ def main():
         help="Checkpoint iteration to export"
     )
 
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=None,
+        help=(
+            "Directory to save OBJ + MTL + PNG. "
+            "Default: <model_path>/export"
+        )
+    )
+
     args = parser.parse_args()
 
     # -----------------------------------------------------
@@ -191,13 +201,30 @@ def main():
             f"Checkpoint not found:\n{checkpoint_file}"
         )
 
-    export_dir = os.path.join(
-        model_path,
-        "export"
-    )
+    # -----------------------------------------------------
+    # Resolve output directory
+    # -----------------------------------------------------
+    if args.output_dir is None:
+        export_dir = os.path.join(
+            model_path,
+            "export"
+        )
+    elif os.path.isabs(args.output_dir):
+        export_dir = args.output_dir
+    else:
+        export_dir = os.path.join(
+            ROOT_DIR,
+            args.output_dir
+        )
 
-    print(f"Loading checkpoint:")
+    export_dir = os.path.normpath(export_dir)
+
+    print("Loading checkpoint:")
     print(checkpoint_dir)
+    print()
+
+    print("Output directory:")
+    print(export_dir)
     print()
 
     mesh = MeshModel()

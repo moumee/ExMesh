@@ -747,6 +747,70 @@ def closest_point_on_triangle(point, a, b, c):
     ab = b - a
     ac = c - a
     ap = point - a
+
+    # -------------------------------------------------
+    # Degenerate triangle guard
+    # -------------------------------------------------
+    normal = np.cross(ab, ac)
+
+    if np.dot(normal, normal) < 1e-20:
+        # Triangle이 거의 선/점이면
+        # 세 edge 중 가장 가까운 점을 사용
+        best_point = a.copy()
+        best_bary = np.array([1.0, 0.0, 0.0])
+        best_dist = np.dot(point - a, point - a)
+
+        # AB
+        ab_len2 = np.dot(ab, ab)
+        if ab_len2 > 1e-20:
+            t = np.dot(point - a, ab) / ab_len2
+            t = min(max(t, 0.0), 1.0)
+
+            candidate = a + t * ab
+            diff = point - candidate
+            dist = np.dot(diff, diff)
+
+            if dist < best_dist:
+                best_dist = dist
+                best_point = candidate
+                best_bary = np.array([1.0 - t, t, 0.0])
+
+        # AC
+        ac_len2 = np.dot(ac, ac)
+        if ac_len2 > 1e-20:
+            t = np.dot(point - a, ac) / ac_len2
+            t = min(max(t, 0.0), 1.0)
+
+            candidate = a + t * ac
+            diff = point - candidate
+            dist = np.dot(diff, diff)
+
+            if dist < best_dist:
+                best_dist = dist
+                best_point = candidate
+                best_bary = np.array([1.0 - t, 0.0, t])
+
+        # BC
+        bc = c - b
+        bc_len2 = np.dot(bc, bc)
+
+        if bc_len2 > 1e-20:
+            t = np.dot(point - b, bc) / bc_len2
+            t = min(max(t, 0.0), 1.0)
+
+            candidate = b + t * bc
+            diff = point - candidate
+            dist = np.dot(diff, diff)
+
+            if dist < best_dist:
+                best_point = candidate
+                best_bary = np.array([0.0, 1.0 - t, t])
+
+        return best_point, best_bary
+
+    # -------------------------------------------------
+    # Original closest-point algorithm
+    # -------------------------------------------------
     d1 = np.dot(ab, ap)
     d2 = np.dot(ac, ap)
 
@@ -789,22 +853,31 @@ def closest_point_on_triangle(point, a, b, c):
     denom = va + vb + vc
 
     if abs(denom) < 1e-15:
-        distances = [
+        distances = np.array([
             np.dot(point - a, point - a),
             np.dot(point - b, point - b),
             np.dot(point - c, point - c)
-        ]
-        index = int(np.argmin(np.asarray(distances)))
+        ])
+
+        index = int(np.argmin(distances))
         bary = np.zeros(3, dtype=np.float64)
         bary[index] = 1.0
-        triangle = (a, b, c)
-        return triangle[index].copy(), bary
+
+        if index == 0:
+            return a.copy(), bary
+        elif index == 1:
+            return b.copy(), bary
+        else:
+            return c.copy(), bary
 
     inv_denom = 1.0 / denom
+
     v = vb * inv_denom
     w = vc * inv_denom
     u = 1.0 - v - w
+
     closest = u * a + v * b + w * c
+
     return closest, np.array([u, v, w])
 
 
@@ -1426,16 +1499,59 @@ def main():
     original_material_ids = np.asarray(mesh.triangle_material_ids).copy()
 
     if args.texture is not None:
+        texture_path = Path(args.texture)
+
+        if not texture_path.exists():
+            raise FileNotFoundError(
+                f"Texture not found: {texture_path}"
+            )
+
+        print(
+            f"[texture] using specified texture: {texture_path}",
+            flush=True
+        )
+
         original_textures = [
-            np.asarray(Image.open(args.texture).convert("RGB"))
+            np.asarray(
+                Image.open(texture_path).convert("RGB")
+            )
         ]
+
     elif mesh.has_textures():
+        print(
+            "[texture] loaded from OBJ/MTL",
+            flush=True
+        )
+
         original_textures = [
             np.asarray(texture).copy()
             for texture in mesh.textures
         ]
+
     else:
-        original_textures = []
+        # OBJ와 같은 이름의 PNG 자동 탐색
+        auto_texture_path = input_path.with_suffix(".png")
+
+        if auto_texture_path.exists():
+            print(
+                f"[texture] auto-detected: {auto_texture_path}",
+                flush=True
+            )
+
+            original_textures = [
+                np.asarray(
+                    Image.open(auto_texture_path).convert("RGB")
+                )
+            ]
+
+        else:
+            print(
+                f"[texture] no texture found "
+                f"(checked {auto_texture_path})",
+                flush=True
+            )
+
+            original_textures = []
 
     has_texture = (
         len(original_triangle_uvs) == 3 * len(faces)
