@@ -31,6 +31,14 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+# The fair protocol is independent of ExMesh's CUDA-only training imports.
+# Dispatch before importing nvdiffrast so geometry and CPU renders also work on
+# evaluation machines without the reconstruction environment.
+if __name__ == "__main__" and any(arg == "--protocol" or arg.startswith("--protocol=") for arg in sys.argv):
+    from evaluate_mesh_preservation import main as preservation_main
+    preservation_main()
+    raise SystemExit(0)
+
 import numpy as np
 from PIL import Image
 import torch
@@ -319,7 +327,8 @@ def metrics_for_pair(candidate: torch.Tensor, reference: torch.Tensor, lpips_mod
 
     p = float(psnr(cand, ref).mean().item())
     s = float(ssim(cand, ref).mean().item())
-    l = float(lpips_model(cand, ref).mean().item())
+    # This implementation expects RGB in [-1, 1], not [0, 1].
+    l = float(lpips_model(cand * 2.0 - 1.0, ref * 2.0 - 1.0).mean().item())
     return {"psnr": p, "ssim": s, "lpips": l}
 
 
@@ -452,10 +461,13 @@ def main():
 
     summary = {
         "reference": str(Path(args.reference).resolve()),
-        "baseline": str(Path(args.baseline).resolve()),
-        "modified": str(Path(args.modified).resolve()),
+        "baseline_path": str(Path(args.baseline).resolve()),
+        "modified_path": str(Path(args.modified).resolve()),
         "source_path": str(Path(args.source_path).resolve()),
         "num_views": len(rows),
+        "protocol": "legacy_source_views",
+        "purpose": "appearance preservation relative to original mesh render; not held-out photo quality",
+        "lpips_input_range": "[-1, 1]; historical runs using [0, 1] are not directly comparable",
         "metric_region": f"reference silhouette bounding box + {args.crop_padding}px padding",
         "baseline": baseline_mean,
         "modified": modified_mean,

@@ -127,6 +127,27 @@ Refine the mesh with topology adaptation.
 python train.py -s workdir/DTU/scan24 -m outputs/DTU/scan24
 ```
 
+### Sobel-guided simplification
+
+The existing ExMesh `train.py` produces `face_importance.npy` in the model
+directory after training. It uses the training renderer's face IDs and the
+shared score functions in `moumee/moumee_img_utils.py`: global visible-pixel
+P95 normalization, per-face pixel means, then equal means over visible views.
+Defaults are Gaussian sigma 1, Gaussian kernel 13, and Sobel kernel 3.
+
+Export the same final checkpoint and pass its score file to the simplifier:
+
+```bash
+python scripts/export_obj.py --model_path outputs/DTU/scan24 --iteration 10000
+python simplification/wild_simplify_xatlas_verified.py --input outputs/DTU/scan24/export/mesh_iter_10000.obj --texture outputs/DTU/scan24/export/mesh_iter_10000.png --output outputs/DTU/scan24/simplified/result.obj --ratio 0.1 --method sobel --face_importance outputs/DTU/scan24/face_importance.npy --importance_lambda 4
+```
+
+Use the final iteration of your own training run in place of `10000`. Face
+order must match the score file. Keep `obj_geometry_topology.py` alongside
+the verified simplifier. `run_sobel_ablation.py` is a historical experiment
+runner and is not needed for deployment. See
+[the plugin migration guide](simplification/SOBEL_PLUGIN_MIGRATION.md).
+
 ### 3. Evaluation
 Evaluate the reconstructed mesh quality using standard metrics.
 

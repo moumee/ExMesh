@@ -124,6 +124,7 @@ celerybeat.pid
 # Environments
 .env
 .venv
+.ablation_env/
 env/
 venv/
 ENV/
@@ -165,3 +166,9 @@ workdir/**
 results/**
 pretrain_models/**
 outputs/**
+
+# Local presentation, reports, and artifact-generation workspace
+*.pptx
+/deliverables/
+/.presentation_build/
+/.audit_build/

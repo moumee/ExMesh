@@ -1,4 +1,3 @@
-from scene.mesh_model import MeshModel
 import os
 import sys
 import argparse
@@ -174,6 +173,9 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # Resolve the repository path before importing ExMesh dependencies.
+    from scene.mesh_model import MeshModel
 
     # -----------------------------------------------------
     # Resolve model path

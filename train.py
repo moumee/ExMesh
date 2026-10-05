@@ -50,9 +50,8 @@ import numpy as np
 import cv2
 
 from moumee.moumee_img_utils import (
-    compute_global_percentile,
+    compute_face_importance,
     compute_sobel_magnitude,
-    normalize_magnitude
 )
 
 
@@ -400,6 +399,8 @@ def training(
             cv2.imwrite(debug_path, image_to_show)
 
     # 학습 완료 후, 최종 메시로 중요도 계산
+    # 마지막 iteration의 topology 변경까지 반영한 메시와 점수를 함께 사용한다.
+    scene.save(opt.iterations)
     cameras = list(scene.getTrainCameras())
     num_faces = mesh.get_faces.shape[0]
 
@@ -407,7 +408,6 @@ def training(
         raise ValueError("중요도를 계산할 카메라가 없습니다.")
 
     magnitude_maps = []    # 시점별 정규화 전 Sobel 크기
-    valid_masks = []       # 시점별 메시가 보이는 픽셀
     face_id_maps = []  # 시점별 픽셀 → 삼각형 ID
 
     # 1. 입력 이미지의 Sobel 크기와 최종 메시의 삼각형 ID 계산
@@ -430,7 +430,6 @@ def training(
 
             # 이후 NumPy로 처리
             T_k_np = T_k.cpu().numpy()
-            valid_mask = T_k_np >= 0
 
             if g_k.shape != T_k_np.shape:
                 raise ValueError(
@@ -439,70 +438,10 @@ def training(
                 )
 
             magnitude_maps.append(g_k)
-            valid_masks.append(valid_mask)
             face_id_maps.append(T_k_np)
 
-    # 2. 모든 시점의 유효 픽셀에서 공통 95백분위수 계산
-    q = compute_global_percentile(
-        magnitude_maps,
-        valid_masks,
-        percentile=95,
-    )
-
-    # 3. 공통 기준으로 각 시점의 Sobel 크기를 [0, 1]로 정규화
-    feature_maps = [
-        normalize_magnitude(g_k, q)
-        for g_k in magnitude_maps
-    ]
-
-    # 4. 픽셀 중요도를 face별로 집계
-    # 각 face는 "실제로 보였던 view"에서만 평균을 냄
-    importance_sum = np.zeros(num_faces, dtype=np.float64)
-    visible_view_count = np.zeros(num_faces, dtype=np.int32)
-
-    for G_k, T_k in zip(feature_maps, face_id_maps):
-        valid = T_k >= 0
-
-        ids = T_k[valid]
-        values = G_k[valid]
-
-        # 이 view에서 각 face가 차지한 픽셀 수
-        counts = np.bincount(
-            ids,
-            minlength=num_faces
-        )
-
-        # 이 view에서 각 face에 대응되는 Sobel importance 합
-        sums = np.bincount(
-            ids,
-            weights=values,
-            minlength=num_faces
-        )
-
-        # 이 view에서 실제로 관측된 face
-        visible = counts > 0
-
-        # 이 view에서의 face별 평균 Sobel importance
-        view_importance = np.zeros(num_faces, dtype=np.float64)
-        view_importance[visible] = (
-            sums[visible] / counts[visible]
-        )
-
-        # 관측된 face만 누적
-        importance_sum[visible] += view_importance[visible]
-        visible_view_count[visible] += 1
-
-    # 각 face가 실제로 관측된 view 수로 평균
-    importance = np.zeros(num_faces, dtype=np.float64)
-
-    visible_faces = visible_view_count > 0
-
-    importance[visible_faces] = (
-        importance_sum[visible_faces]
-        / visible_view_count[visible_faces]
-    )
-
-    importance = importance.astype(np.float32)
+    # 원본 점수 생성 방식을 공통 함수로 사용: P95 → face 평균 → 가시 시점 평균
+    importance, q = compute_face_importance(magnitude_maps, face_id_maps, num_faces)
 
     # 5. Wild에서 읽을 수 있도록 저장
     save_path = os.path.join(
