@@ -35,9 +35,9 @@ conda create -p D:\gamecontents_capstone\third_party\envs\<model> python=3.10 -y
 ```bat
 git clone https://github.com/VAST-AI-Research/TripoSR   :: 사용 커밋 107cefd
 pip install omegaconf==2.3.0 Pillow==10.1.0 einops==0.7.0 transformers==4.35.0 trimesh==4.0.5 rembg huggingface-hub "imageio[ffmpeg]" gradio xatlas==0.0.9 moderngl==5.10.0 PyMCubes onnxruntime
-cd TripoSR && git apply ..\..\ExMesh\alt_models\runners\patches\triposr.diff
+cd TripoSR && git apply ..\..\ExMesh\quick_generation\triposr.diff
 ```
-패치는 두 가지입니다(`runners/patches/triposr.diff`).
+패치는 두 가지입니다(`quick_generation/triposr.diff`).
 1. torchmcubes는 Windows에서 CUDA 빌드가 필요하므로 PyMCubes로 대체했습니다. 축 순서도 맞췄습니다.
 2. `bake_texture`의 원본 버그를 고쳤습니다. 위치 텐서가 CPU에 남아 있어 device 불일치가 나던 문제입니다.
 

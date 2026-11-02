@@ -84,7 +84,7 @@ def main():
                               foreground_ratio=args.foreground_ratio, chunk_size=8192, background_removal="rembg u2net"),
                 timing=timing, peak_vram_gib=peak, vertices=int(len(meshes[0].vertices)),
                 faces=int(len(meshes[0].faces)), textured=True,
-                deviations=["torchmcubes replaced by PyMCubes CPU marching cubes", "bake_texture: query positions moved to the scene-code device (upstream device-mismatch bug)", "see patches/triposr.diff"])
+                deviations=["torchmcubes replaced by PyMCubes CPU marching cubes", "bake_texture: query positions moved to the scene-code device (upstream device-mismatch bug)", "see quick_generation/triposr.diff"])
     (out / "run_info.json").write_text(json.dumps(info, indent=2))
     print(json.dumps(info, indent=2))
 
