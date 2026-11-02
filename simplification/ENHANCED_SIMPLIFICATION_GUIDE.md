@@ -6,8 +6,6 @@ UE5 플러그인 연동 담당자용 문서입니다. 다음 세 가지를 다�
 - 어떻게 호출하는지
 - 결과가 어떤지
 
-플러그인 구현(Codex 작업)에 바로 쓰는 명령·성공 판정·대체 경로는 [UE5_PLUGIN_CODEX_SPEC.md](UE5_PLUGIN_CODEX_SPEC.md)에 따로 정리했습니다.
-
 이전 Sobel 연동 안내는 [SOBEL_PLUGIN_MIGRATION.md](SOBEL_PLUGIN_MIGRATION.md)에 있습니다. 새 옵션을 지정하지 않으면 출력은 이전과 같습니다. 텍스처는 바이트 단위로 같고, OBJ는 파일 이름이 들어가는 `mtllib` 줄만 다릅니다(8.6절).
 
 ## 0. 요약
