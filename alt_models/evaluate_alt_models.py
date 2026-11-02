@@ -281,7 +281,7 @@ def render_cpu_mask(data, camera):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scene", required=True, choices=INPUT_VIEW)
-    parser.add_argument("--model", required=True, help="exmesh | triposr | hunyuan3d2 | triposg | <label>")
+    parser.add_argument("--model", required=True, help="exmesh | triposr | hunyuan3d2 | <label>")
     parser.add_argument("--stage", required=True, choices=("align", "chamfer", "photo"))
     parser.add_argument("--mesh", help="Override mesh path (default: model output, aligned.obj after align)")
     parser.add_argument("--label")

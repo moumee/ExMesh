@@ -10,9 +10,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "deliverables/enhanced_simplification"
-MODELS = {"exmesh": "ExMesh (multi-view)", "triposr": "TripoSR", "triposg": "TripoSG",
+MODELS = {"exmesh": "ExMesh (multi-view)", "triposr": "TripoSR",
           "hunyuan3d2": "Hunyuan3D-2 (dit-v2-0)", "hunyuan3d2_light": "Hunyuan3D-2mini-turbo (light)"}
-LICENSE = {"exmesh": "repo LICENSE.md", "triposr": "MIT", "triposg": "MIT (+BriaRMBG-1.4 non-commercial if used)",
+LICENSE = {"exmesh": "repo LICENSE.md", "triposr": "MIT",
            "hunyuan3d2": "Tencent Hunyuan 3D 2.0 Community: excludes EU/UK/South Korea",
            "hunyuan3d2_light": "Tencent Hunyuan 3D 2.0 Community: excludes EU/UK/South Korea"}
 
@@ -34,8 +34,6 @@ def main():
             photo = load(directory / f"photo_{model}.json")
             run = load(directory / "run_info.json")
             row = dict(scene=scene, model=name, license=LICENSE[model])
-            if run and model == "triposg":
-                row["model"] += " (BriaRMBG input)" if run["input"].endswith("_rgb.png") else " (DTU-mask RGBA input)"
             if chamfer:
                 row.update(chamfer_mm=chamfer["overall"], accuracy_mm=chamfer["mean_d2s"], completeness_mm=chamfer["mean_s2d"])
             if photo:

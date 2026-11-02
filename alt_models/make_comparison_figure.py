@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from evaluate_mesh_preservation import load_mesh, render_cpu, texture_data  # noqa: E402
 from evaluate_alt_models import scene_paths, texture_for  # noqa: E402
 
-COLUMNS = [("exmesh", "ExMesh"), ("triposr", "TripoSR"), ("hunyuan3d2", "Hunyuan3D-2"), ("triposg", "TripoSG (shape)")]
+COLUMNS = [("exmesh", "ExMesh"), ("triposr", "TripoSR"), ("hunyuan3d2", "Hunyuan3D-2")]
 
 
 def shaded(data, camera):

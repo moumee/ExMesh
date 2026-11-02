@@ -12,7 +12,7 @@ ExMesh 대신 단일 이미지 기반 3D 생성 모델을 쓰면 어떤지 비�
 
 - GPU: RTX 4070 12 GB, CUDA Toolkit 12.1, VS 2022 Community(MSVC 14.36 툴셋)
 - 저장소·가상환경·가중치는 ExMesh 저장소 밖 `D:\gamecontents_capstone\third_party\`에 둡니다.
-  - 가중치는 약 45 GB입니다.
+  - Hugging Face 가중치는 약 25 GB입니다(TripoSR, Hunyuan3D-2, Hunyuan3D-2mini).
   - 환경 변수: `HF_HOME=D:\gamecontents_capstone\third_party\hf_cache`, `PIP_CACHE_DIR=...\pip_cache`
 - GPU 작업이 겹치지 않도록 모든 GPU 명령은 `third_party\gpu_run.py --label 이름 -- <명령>`으로 감쌌습니다. 파일 잠금 방식입니다.
 - 입력 이미지: `python alt_models/prepare_inputs.py --item scan83:51 --item scan24:23`
@@ -53,14 +53,6 @@ cd Hunyuan3D-2\hy3dgen\texgen\custom_rasterizer && <env>\python.exe setup.py ins
 - diffusers/transformers는 torch 2.5.1과 호환되는 버전으로 고정했습니다. 최신 diffusers는 `torch.accelerator`가 필요합니다.
 - **라이선스**: Section 1(l)·5(c)에 따라 대한민국에서 모델이나 그 출력을 사용하는 것은 라이선스 범위 밖입니다. 실제 플러그인에는 넣지 마세요.
 
-### TripoSG (MIT; 기본 배경 제거 모델 BriaRMBG-1.4는 비상업 라이선스)
-```bat
-git clone https://github.com/VAST-AI-Research/TripoSG   :: 사용 커밋 fc5c409
-pip install "diffusers==0.32.2" "transformers==4.48.3" "huggingface_hub==0.27.1" "peft==0.14.0" einops opencv-python trimesh omegaconf scikit-image "numpy<2" jaxtyping typeguard pymeshlab
-:: diso (CUDA 확장): vcvars64 환경에서
-<env>\python.exe -m pip install --no-build-isolation diso
-```
-
 ## 3. 실행
 
 ```bat
@@ -68,10 +60,8 @@ pip install "diffusers==0.32.2" "transformers==4.48.3" "huggingface_hub==0.27.1"
 python alt_models/runners/run_triposr.py   --repo <TripoSR>     --image outputs/alt_models/inputs/scan83_view051_rgb.png --out outputs/alt_models/scan83/triposr
 python alt_models/runners/run_hunyuan3d2.py --repo <Hunyuan3D-2> --image ...  --out ...   :: 기본: dit-v2-0, 50 step
 python alt_models/runners/run_hunyuan3d2.py ... --model_path tencent/Hunyuan3D-2mini --subfolder hunyuan3d-dit-v2-mini-turbo --steps 5 --num_chunks 8000 --flashvdm   :: 경량(4 GB)
-python alt_models/runners/run_triposg.py   --repo <TripoSG>     --image outputs/alt_models/inputs_v2/scan83_view051.png --out outputs/alt_models/scan83/triposg
 ```
 - 각 모델의 공식 기본값을 따랐습니다. 다른 점은 `run_info.json`의 `deviations`에 기록되어 있습니다.
-- TripoSG의 기본 배경 제거(BriaRMBG)는 scan83에서 스머프 뒤 벽돌까지 물체로 남겼습니다. 그래서 scan83은 DTU 마스크를 알파로 넣어 다시 실행했습니다. 처음 실행한 결과는 `triposg_briarmbg/`에 보관했습니다.
 
 ## 4. 평가 (`evaluate_alt_models.py`, ExMesh 환경)
 
