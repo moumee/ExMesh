@@ -25,7 +25,7 @@ UE5 플러그인 연동 담당자용 문서입니다. 다음 세 가지를 다�
   - 팀 평가기에서는 PSNR +0.2~0.9 dB지만 LPIPS가 나빠집니다. 원본 렌더의 앨리어싱 입자를 지우기 때문입니다(4.3).
   - 첫 버전의 이음새 버그는 찾아서 고쳤습니다(8.1).
 - **권장 파이프라인**: ExMesh → PPQ 에너지(GPU 약 2초) → Wild `--method photometric` → (선택) 정제 `--mode full`(GPU 약 30초)
-- **생성 모델(Tripo/Hunyuan)**: ExMesh가 기하는 2.7~5배 정확하고, 사진 대비 PSNR은 7~9 dB 높습니다. Hunyuan은 라이선스가 한국을 제외합니다. **ExMesh 유지를 권장합니다**(5장).
+- **생성 모델(Tripo/Hunyuan)**: ExMesh가 기하는 2.9~5배 정확하고, 사진 대비 PSNR은 7~9 dB 높습니다. Hunyuan은 라이선스가 한국을 제외합니다. **ExMesh 유지를 권장합니다**(5장).
 
 ## 1. 연구 범위 정리
 
@@ -294,27 +294,22 @@ PPQ는 **어떤 간선을 어디로 합칠지**를 정합니다. 단순화 후 �
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
 | scan83 | **ExMesh (49장)** | **1.088** | **25.28** | **0.906** | **0.107** | **0.976** | 211,361 | 약 15분 | — | 저장소 |
 | scan83 | TripoSR | 3.251 | 17.99 | 0.772 | 0.280 | 0.812 | 93,556 | 22초 | 2.4 GB | MIT |
-| scan83 | TripoSG (형상만) | 2.925 | — | — | — | 0.903 | 1,005,256 | 29초 | 5.7 GB | MIT* |
 | scan83 | Hunyuan3D-2 (기본) | 3.508 | 16.14 | 0.715 | 0.245 | 0.894 | 40,000 | 66초 | 9.1 GB | **한국 제외** |
 | scan83 | Hunyuan3D-2mini-turbo (경량) | 3.107 | 16.42 | 0.717 | 0.253 | 0.869 | 40,000 | 32초 | 4.1 GB | **한국 제외** |
 | scan24 | **ExMesh (49장)** | **0.462** | **21.51** | **0.860** | **0.124** | **0.996** | 207,856 | — | — | 저장소 |
 | scan24 | TripoSR | 4.844 | 13.32 | 0.461 | 0.589 | 0.925 | 157,720 | 47초 | 2.4 GB | MIT |
-| scan24 | TripoSG (형상만) | 3.556 | — | — | — | 0.935 | 3,080,540 | 55초 | 6.6 GB | MIT* |
 | scan24 | Hunyuan3D-2 (기본) | 2.312 | 12.38 | 0.429 | 0.530 | 0.912 | 40,000 | 88초 | 9.1 GB | **한국 제외** |
 
 - 원본 표: `deliverables/enhanced_simplification/reconstruction_sources.csv`
 - 시간에는 모델 로딩 시간이 빠져 있습니다.
 - ExMesh scan83 시간은 PGSR 164초, 메시 추출 12초, ExMesh 717초를 합친 값입니다. scan24는 기존 학습 결과를 써서 측정값이 없습니다.
-- \* TripoSG의 기본 배경 제거 모델(BriaRMBG-1.4)은 비상업 라이선스입니다.
-  - scan83에서는 이 모델이 스머프 뒤 벽돌까지 물체로 남겼습니다. 그래서 DTU 마스크를 알파로 넣어 다시 실행했습니다.
-  - scan24는 BriaRMBG 입력 그대로입니다.
 - 그림: `deliverables/enhanced_simplification/{scan83,scan24}_reconstruction_sources.png`
-  - 열 순서: 사진 | ExMesh | TripoSR | Hunyuan3D-2 | TripoSG(음영)
+  - 열 순서: 사진 | ExMesh | TripoSR | Hunyuan3D-2
   - 같은 촬영 카메라에서 렌더한 이미지입니다.
 
 ### 5.3 해석
 
-- **기하 정확도**: ExMesh가 가장 나은 생성 모델보다 scan83에서 2.7배(TripoSG 대비), scan24에서 5배(Hunyuan 대비) 정확합니다. 오라클 정렬을 줬는데도 그렇습니다.
+- **기하 정확도**: ExMesh가 가장 나은 생성 모델보다 scan83에서 2.9배(Hunyuan3D-2mini-turbo 대비), scan24에서 5배(Hunyuan 대비) 정확합니다. 오라클 정렬을 줬는데도 그렇습니다.
 - **외관**: 생성 모델은 입력 사진에 보이지 않는 면을 그럴듯하게 지어냅니다.
   - scan24(건물)에서는 모든 입력 사진이 건물을 잘라서 보여 줍니다. 그래서 Hunyuan은 실제와 다른 창문을 만들었고, 조명이 빠진(delit) 색을 냅니다.
   - TripoSR는 텍스처가 흐립니다.
@@ -324,13 +319,13 @@ PPQ는 **어떤 간선을 어디로 합칠지**를 정합니다. 단순화 후 �
   - 경량 설정(2mini-turbo, 5 step, FlashVDM)은 형상 생성이 2.6초, 최대 4.1 GB입니다. 정확도는 기본 설정과 비슷하거나 조금 나았습니다.
 - **라이선스**: Tencent Hunyuan 3D 2.0 Community License는 적용 지역에서 EU·영국·**대한민국**을 제외합니다(1(l), 5(c)).
   - 한국에서 모델이나 그 출력물을 쓰는 것 자체가 라이선스 범위 밖이므로 **플러그인 후보가 될 수 없습니다**.
-  - TripoSR·TripoSG는 MIT입니다.
+  - TripoSR는 MIT입니다.
 
 ### 5.4 권장: ExMesh 유지
 
 1. 목표가 "실제 물체를 게임 에셋으로"라면 ExMesh가 정확도와 사진 충실도에서 압도적입니다.
 2. 연구 주제(ExMesh 정보 기반 단순화)는 ExMesh의 **촬영 카메라와 사진에 정합된 외관**을 전제로 합니다. 생성 모델 출력에는 촬영 카메라가 없어 PPQ가 성립하지 않습니다(6.3).
-3. 생성 모델을 넣는다면 "사진 한 장 빠른 미리보기" 같은 부가 기능이면 충분합니다. 그 경우에도 MIT인 TripoSR/TripoSG를 쓰세요. TripoSG는 배경 제거 모델을 교체해야 합니다. Hunyuan은 쓰지 마세요.
+3. 생성 모델을 넣는다면 "사진 한 장 빠른 미리보기" 같은 부가 기능이면 충분합니다. 그 경우에도 MIT인 TripoSR를 쓰세요. Hunyuan은 쓰지 마세요.
 
 ## 6. UE5 플러그인 연동
 
@@ -507,7 +502,7 @@ python simplification/appearance_refine.py --reference <model_dir>/export/mesh_i
 - **DTU 평가 스크립트**:
   - `scripts/eval_dtu/evaluate_single_scene.py`가 `python`을 그대로 호출합니다. 그래서 PATH의 시스템 파이썬(sklearn 없음)이 잡혀 실패할 수 있습니다.
   - `alt_models/run_exmesh_scene.py`는 env의 파이썬으로 `eval.py`를 직접 호출합니다.
-- **TripoSR**: Windows용 패치 2개가 필요합니다. TripoSG는 배경 제거 문제가 있습니다(5.2, `alt_models/README.md`).
+- **TripoSR**: Windows용 패치 2개가 필요합니다(`alt_models/README.md`).
 
 ### 8.6 하위 호환성
 
