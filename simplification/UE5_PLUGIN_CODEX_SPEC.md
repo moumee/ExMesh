@@ -16,7 +16,7 @@ UE5 임포트: [3]의 결과. [3]을 끄면 [2]의 결과
 ```
 
 - 기본 경로는 `--method photometric`(PPQ)입니다. 기존 `wild`와 `sobel`은 그대로 지원하고 옵션으로 남깁니다.
-- 생성 모델(TripoSR, TripoSG, Hunyuan3D-2)은 플러그인에 넣지 않습니다. `alt_models/`는 비교 실험 코드이고 배포 대상이 아닙니다. Hunyuan3D-2는 라이선스가 한국을 제외합니다.
+- 생성 모델(TripoSR, Hunyuan3D-2)은 플러그인에 넣지 않습니다. `alt_models/`는 비교 실험 코드이고 배포 대상이 아닙니다. Hunyuan3D-2는 라이선스가 한국을 제외합니다.
 
 ## 2. 배포 파일과 환경
 
