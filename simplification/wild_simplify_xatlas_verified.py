@@ -370,7 +370,114 @@ def build_virtual_edges(vertices, faces, radius):
     return virtual_edges
 
 
-def simplify(vertices, faces, target_faces, virtual_radius, track_history, face_weights):
+def fibonacci_sphere(count):
+    """Near-uniform unit directions on the full sphere."""
+    i = np.arange(count, dtype=np.float64) + 0.5
+    z = 1.0 - 2.0 * i / count
+    radius = np.sqrt(np.maximum(0.0, 1.0 - z * z))
+    phi = np.pi * (3.0 - np.sqrt(5.0)) * i
+    return np.column_stack((radius * np.cos(phi), radius * np.sin(phi), z))
+
+
+def face_visibility(vertices, faces, directions=128):
+    """Per-face exterior visibility in [0, 1] (visibility-guided QEM).
+
+    Cosine-weighted fraction of sphere directions from which a face is not
+    occluded by the mesh itself, i.e. 1 - ambient occlusion, following
+    Zhang & Turk, "Visibility-Guided Simplification" (IEEE Vis 2002). Rays
+    start just above the face on the side facing each direction; the larger
+    of the two sides is kept because reconstructed surfaces are often open,
+    one-sided sheets. Zero-area faces get 1 (they add no quadric anyway).
+    """
+    import open3d as o3d
+    triangles = vertices[faces]
+    centroids = triangles.mean(axis=1)
+    normals = np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0])
+    lengths = np.linalg.norm(normals, axis=1)
+    valid = lengths > 0
+    normals[valid] /= lengths[valid, None]
+    offset = 1e-4 * np.linalg.norm(np.ptp(vertices, axis=0))
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(o3d.core.Tensor(vertices.astype(np.float32)),
+                        o3d.core.Tensor(faces.astype(np.uint32)))
+    seen = np.zeros((2, len(faces)))
+    total = np.zeros((2, len(faces)))
+    started = time.perf_counter()
+    for direction in fibonacci_sphere(directions):
+        cosine = normals @ direction
+        side = np.where(cosine >= 0, 1.0, -1.0)
+        origins = centroids + (side * offset)[:, None] * normals
+        rays = np.hstack((origins, np.broadcast_to(direction, origins.shape))).astype(np.float32)
+        escaped = np.isinf(scene.cast_rays(o3d.core.Tensor(rays))["t_hit"].numpy())
+        index = (cosine < 0).astype(np.int64)
+        weight = np.abs(cosine)
+        np.add.at(total, (index, np.arange(len(faces))), weight)
+        np.add.at(seen, (index, np.arange(len(faces))), weight * escaped)
+    visibility = np.max(np.divide(seen, total, out=np.zeros_like(seen), where=total > 0), axis=0)
+    visibility[~valid] = 1.0
+    print(f"[visibility] {directions} directions, mean={visibility.mean():.3f}, "
+          f"faces<0.05: {np.mean(visibility < 0.05):.1%}, "
+          f"elapsed={time.perf_counter()-started:.1f}s", flush=True)
+    return visibility
+
+
+def photometric_face_weights(vertices, faces, density, lam=1.0):
+    """Face weights for the multi-view photometric parallax quadric.
+
+    density = W_f / A_f from photometric_quadric_weights.py, where
+    W_f = sum over capture views and covered pixels of ||grad I . J n_f||^2.
+    Weight 1 + lam * density / mean, mean = sum W / sum A, so lam = 1 gives the
+    photometric term the same total energy as the geometric area term.
+    """
+    triangles = vertices[faces]
+    area = np.linalg.norm(np.cross(triangles[:, 1] - triangles[:, 0],
+                                   triangles[:, 2] - triangles[:, 0]), axis=1) / 2
+    mean = np.sum(density * area) / np.sum(area)
+    if not mean > 0:
+        raise ValueError('Photometric energy is zero; check cameras and mesh alignment')
+    return 1.0 + lam * density / mean
+
+
+def collapse_normal_diagnostics(vertices, local_faces, a, b, position):
+    """Count inversions and numerical degeneracies among surviving local faces.
+
+    Removed and already zero-area faces do not constrain placement. This local
+    orientation check does not guarantee intersection-free output or bound
+    cumulative normal changes over multiple collapses.
+    """
+    flips = 0
+    degeneracies = 0
+    for face in local_faces:
+        has_a = False
+        has_b = False
+        for v in face:
+            has_a = has_a or v == a
+            has_b = has_b or v == b
+        if has_a and has_b:
+            continue
+        before = vertices[face].copy()
+        after = before.copy()
+        for i in range(3):
+            if face[i] == a or face[i] == b:
+                after[i] = position
+        old_normal = np.cross(before[1]-before[0], before[2]-before[0])
+        new_normal = np.cross(after[1]-after[0], after[2]-after[0])
+        old_sq = np.dot(old_normal, old_normal)
+        if old_sq == 0:
+            continue
+        new_sq = np.dot(new_normal, new_normal)
+        if new_sq <= old_sq * 1e-24:
+            degeneracies += 1
+        elif np.dot(old_normal, new_normal) <= 0:
+            flips += 1
+    return flips, degeneracies
+
+
+def simplify(vertices, faces, target_faces, virtual_radius, track_history, face_weights,
+             *, normal_guard=False, diagnostics=None):
+
+    stats = dict(checked=0, rejected=0, accepted=0, accepted_flip_events=0,
+                 accepted_degenerate_events=0)
 
     # The Q matrix from QEM for each vertex
     Q = np.zeros((len(vertices), 4, 4), dtype=np.float64)
@@ -527,6 +634,17 @@ def simplify(vertices, faces, target_faces, virtual_radius, track_history, face_
             fi for fi in (vertex_faces[a] | vertex_faces[b])
             if face_active[fi]
         }
+        if normal_guard or diagnostics is not None:
+            flip_count, degenerate_count = collapse_normal_diagnostics(
+                vertices, faces[np.array(sorted(old_face_ids), dtype=np.int64)], a, b, position)
+            stats['checked'] += 1
+            if normal_guard and (flip_count or degenerate_count):
+                # Neighboring collapses invalidate/requeue this edge normally.
+                stats['rejected'] += 1
+                continue
+            stats['accepted'] += 1
+            stats['accepted_flip_events'] += int(flip_count)
+            stats['accepted_degenerate_events'] += int(degenerate_count)
         old_edges = set(vertex_edges[a]) | set(vertex_edges[b])
         affected_vertices = {a, b}
 
@@ -732,6 +850,11 @@ def simplify(vertices, faces, target_faces, virtual_radius, track_history, face_
 
     active_face_indices = np.where(face_active)[0]
     new_faces = old_to_new[faces[active_face_indices]]
+
+    if diagnostics is not None:
+        diagnostics.update(stats, target_faces=int(target_faces), actual_faces=int(len(new_faces)))
+    if normal_guard:
+        print(f"[normal guard] {stats}", flush=True)
 
     return new_vertices, new_faces, active_face_indices, history
 
@@ -961,17 +1084,23 @@ def barycentric_2d(points_uv, triangle_uv):
     return np.column_stack((alpha, beta, gamma))
 
 
-def rasterize_uv_triangle(triangle_uv, texture_size):
-    """Rasterize texel centers covered by one normalized UV triangle."""
+def rasterize_uv_triangle(triangle_uv, texture_size, supersample=1):
+    """Rasterize texel centers covered by one normalized UV triangle.
+
+    supersample > 1 returns a stratified KxK sub-texel grid per texel instead
+    of the center; rows/cols then repeat once per covered sub-sample.
+    """
     u_min = max(0.0, float(np.min(triangle_uv[:, 0])))
     u_max = min(1.0, float(np.max(triangle_uv[:, 0])))
     v_min = max(0.0, float(np.min(triangle_uv[:, 1])))
     v_max = min(1.0, float(np.max(triangle_uv[:, 1])))
 
-    x0 = max(0, int(np.floor(u_min * texture_size - 0.5)))
-    x1 = min(texture_size - 1, int(np.ceil(u_max * texture_size - 0.5)))
-    y0 = max(0, int(np.floor((1.0 - v_max) * texture_size - 0.5)))
-    y1 = min(texture_size - 1, int(np.ceil((1.0 - v_min) * texture_size - 0.5)))
+    # Sub-samples reach half a texel further than centers; widen the box.
+    reach = 0.5 if supersample == 1 else 1.0
+    x0 = max(0, int(np.floor(u_min * texture_size - reach)))
+    x1 = min(texture_size - 1, int(np.ceil(u_max * texture_size - 1.0 + reach)))
+    y0 = max(0, int(np.floor((1.0 - v_max) * texture_size - reach)))
+    y1 = min(texture_size - 1, int(np.ceil((1.0 - v_min) * texture_size - 1.0 + reach)))
 
     if x1 < x0 or y1 < y0:
         return (np.empty(0, dtype=np.int32),
@@ -982,10 +1111,21 @@ def rasterize_uv_triangle(triangle_uv, texture_size):
     ys = np.arange(y0, y1 + 1, dtype=np.int32)
     yy, xx = np.meshgrid(ys, xs, indexing="ij")
 
-    sample_uv = np.column_stack((
-        (xx.ravel().astype(np.float64) + 0.5) / texture_size,
-        1.0 - (yy.ravel().astype(np.float64) + 0.5) / texture_size,
-    ))
+    if supersample == 1:
+        sample_uv = np.column_stack((
+            (xx.ravel().astype(np.float64) + 0.5) / texture_size,
+            1.0 - (yy.ravel().astype(np.float64) + 0.5) / texture_size,
+        ))
+    else:
+        offsets = (np.arange(supersample, dtype=np.float64) + 0.5) / supersample
+        oy, ox = np.meshgrid(offsets, offsets, indexing="ij")
+        yy = np.repeat(yy.ravel(), supersample * supersample)
+        xx = np.repeat(xx.ravel(), supersample * supersample)
+        count = len(xx) // (supersample * supersample)
+        sample_uv = np.column_stack((
+            (xx.astype(np.float64) + np.tile(ox.ravel(), count)) / texture_size,
+            1.0 - (yy.astype(np.float64) + np.tile(oy.ravel(), count)) / texture_size,
+        ))
     bary = barycentric_2d(sample_uv, triangle_uv)
     if len(bary) == 0:
         return (np.empty(0, dtype=np.int32),
@@ -1002,7 +1142,7 @@ def rasterize_uv_triangle(triangle_uv, texture_size):
     return yy.ravel()[inside], xx.ravel()[inside], bary[inside]
 
 
-def build_xatlas_samples(vertices, faces, active_face_indices, texture_size, padding):
+def build_xatlas_samples(vertices, faces, active_face_indices, texture_size, padding, supersample=1):
     """Create a charted UV atlas with xatlas and rasterize its texels.
 
     Unlike the old per-face atlas, adjacent triangles share UV vertices inside
@@ -1097,7 +1237,7 @@ def build_xatlas_samples(vertices, faces, active_face_indices, texture_size, pad
         f"[atlas:xatlas] rasterizing {len(faces):,} UV triangles...", flush=True)
     total_samples = 0
     for fi, triangle_uv in enumerate(triangle_uvs):
-        rows, cols, bary = rasterize_uv_triangle(triangle_uv, texture_size)
+        rows, cols, bary = rasterize_uv_triangle(triangle_uv, texture_size, supersample)
         if len(rows) == 0:
             continue
 
@@ -1195,7 +1335,7 @@ def successive_map(points, barycentrics, face_ids, history):
     return current_faces, current_barycentrics
 
 
-def sample_texture_bilinear(texture, uvs):
+def sample_texture_bilinear(texture, uvs, as_float=False):
     if texture.ndim == 2:
         texture = np.repeat(texture[:, :, None], 3, axis=2)
     if texture.shape[2] == 4:
@@ -1221,6 +1361,8 @@ def sample_texture_bilinear(texture, uvs):
     top = c00 * (1.0 - wx) + c10 * wx
     bottom = c01 * (1.0 - wx) + c11 * wx
     result = top * (1.0 - wy) + bottom * wy
+    if as_float:
+        return np.clip(result, 0.0, 255.0)
     return np.clip(result, 0.0, 255.0).astype(np.uint8)
 
 
@@ -1253,7 +1395,8 @@ def bake_texture(
     original_textures,
     texture_size,
     atlas_mode,
-    texture_padding
+    texture_padding,
+    supersample=1
 ):
     if atlas_mode == "xatlas":
         atlas_data = build_xatlas_samples(
@@ -1261,7 +1404,8 @@ def bake_texture(
             faces,
             active_face_indices,
             texture_size,
-            texture_padding
+            texture_padding,
+            supersample
         )
     else:
         atlas_data = build_grid_atlas_samples(
@@ -1296,6 +1440,11 @@ def bake_texture(
     )
     material_ids = original_material_ids[mapped_faces]
     atlas = np.zeros((atlas_size, atlas_size, 3), dtype=np.uint8)
+    if supersample > 1:
+        # Box filter: each texel averages every sub-sample covering it, across
+        # all triangles, so chart-border texels get coverage-weighted colors.
+        color_sum = np.zeros((atlas_size, atlas_size, 3), dtype=np.float64)
+        sample_count = np.zeros((atlas_size, atlas_size), dtype=np.int64)
 
     for material_id in np.unique(material_ids):
         indices = np.where(material_ids == material_id)[0]
@@ -1308,6 +1457,13 @@ def bake_texture(
         if texture_index < 0 or texture_index >= len(original_textures):
             texture_index = 0
 
+        if supersample > 1:
+            rows, cols = pixels[indices, 0], pixels[indices, 1]
+            np.add.at(color_sum, (rows, cols), sample_texture_bilinear(
+                original_textures[texture_index], source_uvs[indices], as_float=True))
+            np.add.at(sample_count, (rows, cols), 1)
+            continue
+
         colors = sample_texture_bilinear(
             original_textures[texture_index],
             source_uvs[indices]
@@ -1316,6 +1472,11 @@ def bake_texture(
             pixels[indices, 0],
             pixels[indices, 1]
         ] = colors
+
+    if supersample > 1:
+        covered = sample_count > 0
+        atlas[covered] = np.clip(np.rint(color_sum[covered] / sample_count[covered, None]),
+                                 0, 255).astype(np.uint8)
 
     if atlas_mode == "grid":
         # Preserve the old per-tile border fill in legacy mode.
@@ -1401,7 +1562,7 @@ else:
     for _name in ("closest_point_on_triangle", "point_triangle_distance_sq",
                   "segment_segment_distance_sq", "segment_intersects_triangle",
                   "triangle_triangle_distance_sq", "closest_vertex_pair",
-                  "virtual_edge_batch", "project_samples"):
+                  "virtual_edge_batch", "project_samples", "collapse_normal_diagnostics"):
         globals()[_name] = njit(cache=True)(globals()[_name])
 
 
@@ -1432,7 +1593,18 @@ def main():
         default=4.0,
         help="Sobel face importance weight. Default: 4.0. 0 uses the unweighted Wild-Mesh simplification cost.",
     )
-    parser.add_argument('--method', choices=('wild','sobel'), default='wild')
+    parser.add_argument('--method', choices=('wild','sobel','guarded','photometric'), default='wild')
+    parser.add_argument("--face_energy",
+                        help="Photometric energy density npy (photometric_quadric_weights.py), required for --method photometric")
+    parser.add_argument("--photometric_lambda", type=float, default=1.0,
+                        help="Photometric term weight relative to the geometric term. Default: 1.0 (equal energy)")
+    parser.add_argument("--visibility", action="store_true",
+                        help="Scale face quadrics by exterior visibility (combines with any --method).")
+    parser.add_argument("--visibility_floor", type=float, default=0.05,
+                        help="Weight of fully occluded faces: floor + (1-floor)*visibility. Default: 0.05")
+    parser.add_argument("--visibility_directions", type=int, default=128)
+    parser.add_argument("--texture_supersample", type=int, default=1,
+                        help="KxK sub-texel samples per atlas texel, box-filtered. 1 = legacy center sampling.")
     args = parser.parse_args()
     run_started = time.perf_counter()
     if args.texture_size < 1:
@@ -1441,6 +1613,10 @@ def main():
         parser.error("--texture_padding must be non-negative")
     if args.virtual_radius is not None and args.virtual_radius < 0:
         parser.error("--virtual_radius must be non-negative")
+    if not 0.0 <= args.visibility_floor <= 1.0 or args.visibility_directions < 1:
+        parser.error("--visibility_floor must be in [0, 1] and --visibility_directions positive")
+    if args.texture_supersample < 1 or (args.texture_supersample > 1 and args.atlas != "xatlas"):
+        parser.error("--texture_supersample must be >= 1 and needs --atlas xatlas when > 1")
     if not NUMBA_AVAILABLE:
         warnings.warn(
             "Numba is not installed; use pip install numba for faster distance and texture mapping loops.")
@@ -1480,6 +1656,19 @@ def main():
         if not np.isfinite(args.importance_lambda) or args.importance_lambda < 0:
             raise ValueError('Invalid Sobel lambda')
         face_weights += args.importance_lambda * importance
+    if args.method == 'photometric':
+        if not args.face_energy:
+            parser.error('--method photometric requires --face_energy')
+        density = np.load(args.face_energy, allow_pickle=False).astype(np.float64)
+        if density.shape != (len(faces),) or not np.all(np.isfinite(density)) or np.any(density < 0):
+            raise ValueError('Photometric energy must be finite, non-negative, one per original face')
+        if not np.isfinite(args.photometric_lambda) or args.photometric_lambda < 0:
+            raise ValueError('Invalid photometric lambda')
+        face_weights = photometric_face_weights(vertices, faces, density, args.photometric_lambda)
+    if args.visibility:
+        visibility = face_visibility(vertices, faces, args.visibility_directions)
+        np.save(output_path.with_suffix('.visibility.npy'), visibility.astype(np.float32))
+        face_weights *= args.visibility_floor + (1.0 - args.visibility_floor) * visibility
 
     if not 0.0 < args.ratio <= 1.0:
         parser.error(
@@ -1567,14 +1756,18 @@ def main():
     else:
         virtual_radius = args.virtual_radius
 
+    diagnostics = {}
+    simplify_started = time.perf_counter()
     simplified_vertices, simplified_faces, active_face_indices, history = simplify(
         vertices,
         faces,
         target_faces,
         virtual_radius,
         has_texture,
-        face_weights
+        face_weights,
+        normal_guard=args.method == 'guarded', diagnostics=diagnostics
     )
+    simplify_seconds = time.perf_counter() - simplify_started
 
     if has_texture:
         if output_path.suffix.lower() != ".obj":
@@ -1593,7 +1786,8 @@ def main():
             original_textures,
             args.texture_size,
             args.atlas,
-            args.texture_padding
+            args.texture_padding,
+            args.texture_supersample
         )
 
         write_textured_obj(
@@ -1623,6 +1817,10 @@ def main():
             simplified_mesh
         )
 
+    output_path.with_suffix('.statistics.json').write_text(json.dumps(dict(
+        method=args.method, visibility=args.visibility, visibility_floor=args.visibility_floor,
+        texture_supersample=args.texture_supersample, simplification_seconds=simplify_seconds,
+        total_seconds=time.perf_counter()-run_started, **diagnostics), indent=2))
     print(
         f"[done] faces={len(simplified_faces):,}, elapsed={time.perf_counter()-run_started:.1f}s, output={output_path}", flush=True)
 
