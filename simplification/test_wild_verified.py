@@ -51,15 +51,17 @@ class WildAuditTests(unittest.TestCase):
         for y in range(3):
             for x in range(3):
                 a=y*4+x;f += [[a,a+1,a+4],[a+1,a+5,a+4]]
-        calls=[];original=wild.compute_edge_cost
-        def checking(edge,vertices,q,ve,ef,cache=None):
-            if cache is not None:
-                va,bq=cache;area=va[edge[0]]+va[edge[1]]-bq.get(edge,np.zeros((4,4)))
+        calls=[];original=wild.compute_edge_costs
+        def checking(edges,vertices,q,ve,ef,cache=None):
+            va,bq=cache
+            for edge in edges:
+                area=va[edge[0]]+va[edge[1]]-bq.get(edge,np.zeros((4,4)))
                 np.testing.assert_allclose(area,wild.compute_area_quadric(edge,vertices,ve,ef),atol=1e-12)
-            calls.append(edge)
-            return original(edge,vertices,q,ve,ef,cache)
-        with patch.object(wild,'compute_edge_cost',side_effect=checking):
-            result=wild.simplify(v.copy(),np.array(f),6,0,True,np.ones(len(f)))
+                calls.append(edge)
+            return original(edges,vertices,q,ve,ef,cache)
+        # reuse_costs=False: every edge around a collapse is recomputed, so all of them are checked.
+        with patch.object(wild,'compute_edge_costs',side_effect=checking):
+            result=wild.simplify(v.copy(),np.array(f),6,0,True,np.ones(len(f)),reuse_costs=False)
         self.assertGreater(len(calls),60)
         self.assertLessEqual(len(result[1]),6)
         self.assertTrue(np.all(np.isfinite(result[0])))

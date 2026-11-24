@@ -44,5 +44,30 @@ Nullspace를 원점으로 당기지 않고 midpoint에 유지한다. 제곱 오�
 미사용 원본 구조 보존 확장은 제거했다. 현재 verified 구현은 Wild와 Sobel만 지원한다.
 현재 출력은 `outputs/DTU/scan24/sobel_current/meshes`에 있고, 원본207,856 faces에서 목표20k/10k/5k로 독립 단순화했다. Sobelλ4·σ1·Gaussian13·Sobel3, xatlas1024/padding2.
 
-검증: `.ablation_env/Scripts/python.exe -m unittest discover -s simplification -p test_wild_verified.py -v`.
+검증: `.ablation_env/Scripts/python.exe -m unittest discover -s simplification -p "test_wild_*.py" -v`.
 세부 실행·자료 경로: `deliverables/Sobel_통합실험_스크립트와_파일경로.md`.
+
+## 속도 최적화 (2026-11)
+
+`wild_simplify_xatlas_verified.py`의 실행 시간을 줄였다. 단순화 결과(정점, face, collapse 순서)는 바꾸지 않았다.
+
+| 99,998 faces (Pixal3D), ratio 0.1 | 이전 | 현재 |
+|:---|---:|---:|
+| Numba 있음 | 98초 | 14초 |
+| Numba 없음 | 1,247초 | 30초 |
+
+- **Edge 비용 재사용.** 이전에는 collapse마다 주변 edge 약 36개의 비용을 edge마다 `eigh`와 `solve`로 다시 계산했다. 이제 입력(양 끝 정점의 Q, 위치, boundary 항)이 바뀐 edge만(평균 약 7개) `compute_edge_costs()`/`minimize_quadrics()`로 한 번에 계산한다. Rank가 부족한 행은 기존 `minimize_quadric()`을 그대로 쓴다.
+- **Heap.** 비용이 그대로인 edge는 heap에 다시 넣지 않고 동률 처리 번호만 갱신하며, 그 entry가 맨 위에 왔을 때 새 번호로 옮긴다. 번호는 커지기만 하므로 pop 순서는 매번 다시 넣는 방식과 같다.
+- **기준 루프.** `simplify(..., reuse_costs=False)`는 주변 edge를 모두 다시 계산하고 다시 넣는 기존 방식이다. 기본값(`True`)과 collapse 순서가 같은지 테스트한다.
+- **Texture 역추적.** Collapse history 전체를 Numba kernel 하나(`trace_history`)로 처리한다. Numba가 없으면 history step마다 NumPy로 벡터화한 `closest_points_barycentric()`을 쓴다. 이전에는 이 구간이 순수 Python 이중 루프라서 Numba 없이 20분 가까이 걸렸다.
+- **Closest point.** 배열 임시값과 BLAS 호출 없이 scalar 산술로 다시 썼다(`closest_point_barycentric`). Numba 경로와 NumPy 경로가 같은 연산 순서를 쓰므로 Numba 유무와 관계없이 같은 texture가 나온다.
+- **그 밖.** UV rasterize kernel(`rasterize_uv_triangles`), xatlas가 face 순서를 유지한 경우의 빠른 대응(`match_atlas_faces`), 다른 component의 bounding box 근처 face만 보는 virtual edge 탐색(`near_other_component`), SciPy connected components.
+
+검증한 내용:
+
+- 원본 구현과 `simplify()` 출력(정점, face, history)이 랜덤 메시 60개(boundary, 평면 동률, 닫힌 표면, virtual edge, seam, 중복·퇴화 face, normal guard, face weight)에서 bit 단위로 같다.
+- 실제 메시 두 개(Pixal3D 99,998 faces, TripoSR 103,252 faces)에서 wild/guarded/photometric/visibility, ratio 0.1–0.5의 출력 OBJ가 이전 구현과 byte 단위로 같다.
+- Texture는 1024² texel 중 15–48개가 달라진다(PSNR 80 dB 이상). Closest point의 내적을 BLAS(FMA) 대신 명시적 산술로 계산하면서 마지막 자리 반올림이 달라졌고, 거리가 같은 이웃 삼각형 사이의 선택이 바뀐 texel이다.
+- `test_wild_fast_paths.py`: 배치 비용과 단일 비용, 비용 재사용과 기준 루프, scalar/array closest point, Numba/NumPy history 역추적, rasterize kernel과 삼각형별 rasterize를 각각 대조한다. Numba 유무 양쪽에서 통과한다.
+
+Numba는 `requirements.txt`에 추가했다. 없어도 동작하지만 texture 단계가 느려진다.

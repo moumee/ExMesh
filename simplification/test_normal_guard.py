@@ -30,14 +30,17 @@ class NormalGuardTests(unittest.TestCase):
         # Force a virtual edge whose proposed position would invert a face.
         v = np.vstack([self.v[:3], [[2., 2, .01], [3., 2, .01], [2., 3, .01]]])
         f = np.array([[0, 1, 2], [3, 4, 5]])
-        def cost(edge, vertices, *unused):
+        def cost(edge, vertices):
             if edge == (0, 3):
                 return -1., np.array([2., 2, .01])
             return 1., (vertices[edge[0]]+vertices[edge[1]])/2
+        def costs(edges, vertices, *unused):
+            results = [cost(edge, vertices) for edge in edges]
+            return np.array([c for c, _ in results]), np.array([p for _, p in results])
         for guard in (False, True):
             stats = {}
             with patch.object(wild, 'build_virtual_edges', return_value={(0, 3)}), \
-                    patch.object(wild, 'compute_edge_cost', side_effect=cost):
+                    patch.object(wild, 'compute_edge_costs', side_effect=costs):
                 result = wild.simplify(v.copy(), f.copy(), 1, .1, True, np.ones(2),
                                        normal_guard=guard, diagnostics=stats)
             self.assertLessEqual(len(result[1]), 1)

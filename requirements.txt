@@ -6,3 +6,4 @@ trimesh
 xatlas
 imageio
 scikit-image
+numba

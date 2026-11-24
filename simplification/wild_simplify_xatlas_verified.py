@@ -16,6 +16,7 @@ import heapq
 import time
 import warnings
 import json
+from scipy.sparse import coo_matrix, csgraph
 from scipy.spatial import cKDTree
 from scipy.ndimage import distance_transform_edt
 from PIL import Image
@@ -86,15 +87,266 @@ def compute_edge_cost(edge, vertices, Q, vertex_edges, edge_faces, area_cache=No
     return minimize_quadric(Q_total, (vertices[a] + vertices[b]) / 2.)
 
 
+def minimize_quadrics(quadrics, midpoints, rcond=1e-10):
+    """minimize_quadric for a stack of quadrics; returns (costs, positions).
+
+    One batched eigendecomposition and solve replace a pair of LAPACK calls
+    per edge. Rank-deficient rows are passed to minimize_quadric itself.
+    """
+    count = len(quadrics)
+    costs = np.empty(count, dtype=np.float64)
+    positions = np.empty((count, 3), dtype=np.float64)
+    if count == 0:
+        return costs, positions
+    if not np.all(np.isfinite(quadrics)):
+        raise ValueError('Non-finite quadric')
+    upper = quadrics[:, :3, :3]
+    a = (upper + upper.transpose(0, 2, 1)) * .5
+    values = np.linalg.eigh(a)[0]
+    scale = np.maximum(values[:, 2], 0.)
+    if np.any(values[:, 0] < -np.maximum(scale * 1e-7, 1e-20)):
+        raise ValueError('Quadric is materially indefinite')
+    full_rank = (scale > 0) & np.all(values > (scale * rcond)[:, None], axis=1)
+    if full_rank.all():
+        rows = slice(None)
+    else:
+        rows = np.flatnonzero(full_rank)
+        for row in np.flatnonzero(~full_rank):
+            costs[row], positions[row] = minimize_quadric(quadrics[row], midpoints[row], rcond)
+        a, quadrics = a[rows], quadrics[rows]
+    if len(a):
+        solved = np.linalg.solve(a, -quadrics[:, :3, 3, None])[:, :, 0]
+        h = np.ones((len(a), 4), dtype=np.float64)
+        h[:, :3] = solved
+        value = (h[:, None, :] @ quadrics @ h[:, :, None])[:, 0, 0]
+        costs[rows] = np.maximum(value, 0.)
+        positions[rows] = solved
+    return costs, positions
+
+
+def compute_edge_costs(edges, vertices, Q, vertex_edges, edge_faces, area_cache=None):
+    """compute_edge_cost for a list of edges; returns (costs, positions)."""
+    ends = np.array(edges, dtype=np.int64).reshape(-1, 2)
+    a, b = ends[:, 0], ends[:, 1]
+    if area_cache is None:
+        area = np.zeros((len(edges), 4, 4), dtype=np.float64)
+        for row, edge in enumerate(edges):
+            area[row] = compute_area_quadric(edge, vertices, vertex_edges, edge_faces)
+    else:
+        vertex_area, boundary_quadrics = area_cache
+        area = vertex_area[a] + vertex_area[b]
+        if boundary_quadrics:
+            for row, edge in enumerate(edges):
+                shared = boundary_quadrics.get(edge)
+                if shared is not None:
+                    area[row] -= shared  # union: shared boundary edge counted once
+    return minimize_quadrics(Q[a] + Q[b] + area, (vertices[a] + vertices[b]) / 2.)
+
+
+def closest_point_barycentric(px, py, pz, ax, ay, az, bx, by, bz, cx, cy, cz):
+    """Closest point of triangle abc to p: (squared distance, u, v, w).
+
+    Scalar arithmetic only, so Numba compiles it without array temporaries.
+    closest_points_barycentric is the same sequence of operations on arrays.
+    """
+    abx, aby, abz = bx - ax, by - ay, bz - az
+    acx, acy, acz = cx - ax, cy - ay, cz - az
+    apx, apy, apz = px - ax, py - ay, pz - az
+    nx = aby * acz - abz * acy
+    ny = abz * acx - abx * acz
+    nz = abx * acy - aby * acx
+
+    if nx * nx + ny * ny + nz * nz < 1e-20:
+        # Triangle이 거의 선/점이면 세 edge 중 가장 가까운 점을 사용
+        best = apx * apx + apy * apy + apz * apz
+        u, v, w = 1.0, 0.0, 0.0
+        length = abx * abx + aby * aby + abz * abz
+        if length > 1e-20:
+            t = min(max((apx * abx + apy * aby + apz * abz) / length, 0.0), 1.0)
+            dx, dy, dz = px - (ax + t * abx), py - (ay + t * aby), pz - (az + t * abz)
+            distance = dx * dx + dy * dy + dz * dz
+            if distance < best:
+                best = distance
+                u, v, w = 1.0 - t, t, 0.0
+        length = acx * acx + acy * acy + acz * acz
+        if length > 1e-20:
+            t = min(max((apx * acx + apy * acy + apz * acz) / length, 0.0), 1.0)
+            dx, dy, dz = px - (ax + t * acx), py - (ay + t * acy), pz - (az + t * acz)
+            distance = dx * dx + dy * dy + dz * dz
+            if distance < best:
+                best = distance
+                u, v, w = 1.0 - t, 0.0, t
+        bcx, bcy, bcz = cx - bx, cy - by, cz - bz
+        length = bcx * bcx + bcy * bcy + bcz * bcz
+        if length > 1e-20:
+            t = ((px - bx) * bcx + (py - by) * bcy + (pz - bz) * bcz) / length
+            t = min(max(t, 0.0), 1.0)
+            dx, dy, dz = px - (bx + t * bcx), py - (by + t * bcy), pz - (bz + t * bcz)
+            distance = dx * dx + dy * dy + dz * dz
+            if distance < best:
+                best = distance
+                u, v, w = 0.0, 1.0 - t, t
+        return best, u, v, w
+
+    d1 = abx * apx + aby * apy + abz * apz
+    d2 = acx * apx + acy * apy + acz * apz
+    if d1 <= 0.0 and d2 <= 0.0:
+        return apx * apx + apy * apy + apz * apz, 1.0, 0.0, 0.0
+
+    bpx, bpy, bpz = px - bx, py - by, pz - bz
+    d3 = abx * bpx + aby * bpy + abz * bpz
+    d4 = acx * bpx + acy * bpy + acz * bpz
+    if d3 >= 0.0 and d4 <= d3:
+        return bpx * bpx + bpy * bpy + bpz * bpz, 0.0, 1.0, 0.0
+
+    vc = d1 * d4 - d3 * d2
+    if vc <= 0.0 and d1 >= 0.0 and d3 <= 0.0:
+        v = d1 / (d1 - d3)
+        dx, dy, dz = px - (ax + v * abx), py - (ay + v * aby), pz - (az + v * abz)
+        return dx * dx + dy * dy + dz * dz, 1.0 - v, v, 0.0
+
+    cpx, cpy, cpz = px - cx, py - cy, pz - cz
+    d5 = abx * cpx + aby * cpy + abz * cpz
+    d6 = acx * cpx + acy * cpy + acz * cpz
+    if d6 >= 0.0 and d5 <= d6:
+        return cpx * cpx + cpy * cpy + cpz * cpz, 0.0, 0.0, 1.0
+
+    vb = d5 * d2 - d1 * d6
+    if vb <= 0.0 and d2 >= 0.0 and d6 <= 0.0:
+        w = d2 / (d2 - d6)
+        dx, dy, dz = px - (ax + w * acx), py - (ay + w * acy), pz - (az + w * acz)
+        return dx * dx + dy * dy + dz * dz, 1.0 - w, 0.0, w
+
+    va = d3 * d6 - d5 * d4
+    if va <= 0.0 and (d4 - d3) >= 0.0 and (d5 - d6) >= 0.0:
+        w = (d4 - d3) / ((d4 - d3) + (d5 - d6))
+        dx = px - (bx + w * (cx - bx))
+        dy = py - (by + w * (cy - by))
+        dz = pz - (bz + w * (cz - bz))
+        return dx * dx + dy * dy + dz * dz, 0.0, 1.0 - w, w
+
+    denom = va + vb + vc
+    if abs(denom) < 1e-15:
+        to_a = apx * apx + apy * apy + apz * apz
+        to_b = bpx * bpx + bpy * bpy + bpz * bpz
+        to_c = cpx * cpx + cpy * cpy + cpz * cpz
+        if to_a <= to_b and to_a <= to_c:
+            return to_a, 1.0, 0.0, 0.0
+        if to_b <= to_c:
+            return to_b, 0.0, 1.0, 0.0
+        return to_c, 0.0, 0.0, 1.0
+
+    inv_denom = 1.0 / denom
+    v = vb * inv_denom
+    w = vc * inv_denom
+    u = 1.0 - v - w
+    dx = px - (u * ax + v * bx + w * cx)
+    dy = py - (u * ay + v * by + w * cy)
+    dz = pz - (u * az + v * bz + w * cz)
+    return dx * dx + dy * dy + dz * dz, u, v, w
+
+
+def closest_points_barycentric(points, triangles):
+    """closest_point_barycentric for every (point, triangle) pair, with NumPy.
+
+    points (m, 3), triangles (k, 3, 3) -> squared distances (m, k) and
+    barycentrics (m, k, 3). The branches are applied from last to first, so
+    each pair ends with the first branch the scalar version would take.
+    """
+    px, py, pz = (points[:, None, axis] for axis in range(3))
+    ax, ay, az = (triangles[None, :, 0, axis] for axis in range(3))
+    bx, by, bz = (triangles[None, :, 1, axis] for axis in range(3))
+    cx, cy, cz = (triangles[None, :, 2, axis] for axis in range(3))
+    zero = np.zeros(np.broadcast_shapes(px.shape, ax.shape), dtype=np.float64)
+    one = zero + 1.0
+
+    def squared(dx, dy, dz):
+        return dx * dx + dy * dy + dz * dz
+
+    def choose(mask, distance, u, v, w):
+        nonlocal best, bu, bv, bw
+        best = np.where(mask, distance, best)
+        bu, bv, bw = np.where(mask, u, bu), np.where(mask, v, bv), np.where(mask, w, bw)
+
+    abx, aby, abz = bx - ax, by - ay, bz - az
+    acx, acy, acz = cx - ax, cy - ay, cz - az
+    bcx, bcy, bcz = cx - bx, cy - by, cz - bz
+    apx, apy, apz = px - ax, py - ay, pz - az
+    bpx, bpy, bpz = px - bx, py - by, pz - bz
+    cpx, cpy, cpz = px - cx, py - cy, pz - cz
+    to_a, to_b, to_c = squared(apx, apy, apz), squared(bpx, bpy, bpz), squared(cpx, cpy, cpz)
+    d1 = abx * apx + aby * apy + abz * apz
+    d2 = acx * apx + acy * apy + acz * apz
+    d3 = abx * bpx + aby * bpy + abz * bpz
+    d4 = acx * bpx + acy * bpy + acz * bpz
+    d5 = abx * cpx + aby * cpy + abz * cpz
+    d6 = acx * cpx + acy * cpy + acz * cpz
+    vc = d1 * d4 - d3 * d2
+    vb = d5 * d2 - d1 * d6
+    va = d3 * d6 - d5 * d4
+    denom = va + vb + vc
+
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        inv_denom = 1.0 / denom
+        v = vb * inv_denom
+        w = vc * inv_denom
+        u = 1.0 - v - w
+        best = squared(px - (u * ax + v * bx + w * cx),
+                       py - (u * ay + v * by + w * cy),
+                       pz - (u * az + v * bz + w * cz))
+        bu, bv, bw = u + zero, v + zero, w + zero
+
+        flat = np.abs(denom) < 1e-15
+        near_a = (to_a <= to_b) & (to_a <= to_c)
+        choose(flat, to_c, zero, zero, one)
+        choose(flat & ~near_a & (to_b <= to_c), to_b, zero, one, zero)
+        choose(flat & near_a, to_a, one, zero, zero)
+
+        w = (d4 - d3) / ((d4 - d3) + (d5 - d6))
+        choose((va <= 0.0) & ((d4 - d3) >= 0.0) & ((d5 - d6) >= 0.0),
+               squared(px - (bx + w * bcx), py - (by + w * bcy), pz - (bz + w * bcz)),
+               zero, 1.0 - w, w)
+        w = d2 / (d2 - d6)
+        choose((vb <= 0.0) & (d2 >= 0.0) & (d6 <= 0.0),
+               squared(px - (ax + w * acx), py - (ay + w * acy), pz - (az + w * acz)),
+               1.0 - w, zero, w)
+        choose((d6 >= 0.0) & (d5 <= d6), to_c, zero, zero, one)
+        v = d1 / (d1 - d3)
+        choose((vc <= 0.0) & (d1 >= 0.0) & (d3 <= 0.0),
+               squared(px - (ax + v * abx), py - (ay + v * aby), pz - (az + v * abz)),
+               1.0 - v, v, zero)
+        choose((d3 >= 0.0) & (d4 <= d3), to_b, zero, one, zero)
+        choose((d1 <= 0.0) & (d2 <= 0.0), to_a, one, zero, zero)
+
+        nx = aby * acz - abz * acy
+        ny = abz * acx - abx * acz
+        nz = abx * acy - aby * acx
+        sliver = np.broadcast_to(squared(nx, ny, nz) < 1e-20, zero.shape)
+        if np.any(sliver):
+            # Triangle이 거의 선/점이면 세 edge 중 가장 가까운 점을 사용
+            def on_edge(ox, oy, oz, ex, ey, ez, rx, ry, rz):
+                """Clamped projection on the edge o + t * e, where r = p - o."""
+                length = squared(ex, ey, ez)
+                t = np.minimum(np.maximum((rx * ex + ry * ey + rz * ez) / length, 0.0), 1.0)
+                distance = squared(px - (ox + t * ex), py - (oy + t * ey), pz - (oz + t * ez))
+                return sliver & (length > 1e-20) & (distance < best), distance, t
+
+            choose(sliver, to_a, one, zero, zero)
+            closer, distance, t = on_edge(ax, ay, az, abx, aby, abz, apx, apy, apz)
+            choose(closer, distance, 1.0 - t, t, zero)
+            closer, distance, t = on_edge(ax, ay, az, acx, acy, acz, apx, apy, apz)
+            choose(closer, distance, 1.0 - t, zero, t)
+            closer, distance, t = on_edge(bx, by, bz, bcx, bcy, bcz, bpx, bpy, bpz)
+            choose(closer, distance, zero, 1.0 - t, t)
+    return best, np.stack((bu, bv, bw), axis=-1)
+
+
 def point_triangle_distance_sq(point, triangle):
-    closest, _ = closest_point_on_triangle(
-        point,
-        triangle[0],
-        triangle[1],
-        triangle[2]
-    )
-    delta = point - closest
-    return np.dot(delta, delta)
+    return closest_point_barycentric(
+        point[0], point[1], point[2],
+        triangle[0, 0], triangle[0, 1], triangle[0, 2],
+        triangle[1, 0], triangle[1, 1], triangle[1, 2],
+        triangle[2, 0], triangle[2, 1], triangle[2, 2])[0]
 
 
 def segment_segment_distance_sq(p1, q1, p2, q2):
@@ -255,42 +507,36 @@ def virtual_edge_batch(i, candidates, triangles, faces, vertices, threshold_sq):
 
 
 def connected_components(vertices, faces):
-    parent = np.arange(len(vertices), dtype=np.int64)
-    rank = np.zeros(len(vertices), dtype=np.int8)
+    """Component label of every face (faces that share a vertex are connected)."""
+    if len(faces) == 0:
+        return np.empty(0, dtype=np.int64)
+    rows = np.concatenate((faces[:, 0], faces[:, 1]))
+    cols = np.concatenate((faces[:, 1], faces[:, 2]))
+    graph = coo_matrix((np.ones(len(rows), dtype=np.int8), (rows, cols)),
+                       shape=(len(vertices), len(vertices)))
+    labels = csgraph.connected_components(graph, directed=False)[1]
+    return labels[faces[:, 0]].astype(np.int64)
 
-    def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
 
-    def union(a, b):
-        ra = find(a)
-        rb = find(b)
+def near_other_component(bounds_min, bounds_max, face_components, threshold_sq):
+    """Faces whose box is closer than the threshold to the box of another component.
 
-        if ra == rb:
-            return
-
-        if rank[ra] < rank[rb]:
-            parent[ra] = rb
-        elif rank[ra] > rank[rb]:
-            parent[rb] = ra
-        else:
-            parent[rb] = ra
-            rank[ra] += 1
-
-    for face in faces:
-        i, j, k = face
-        union(i, j)
-        union(j, k)
-        union(k, i)
-
-    face_components = np.empty(len(faces), dtype=np.int64)
-
-    for fi, face in enumerate(faces):
-        face_components[fi] = find(int(face[0]))
-
-    return face_components
+    A face box lies inside its component box, so a pair of faces that passes
+    the box-gap test of build_virtual_edges always has both faces marked here.
+    The other faces cannot get a virtual edge and skip the neighbor query.
+    """
+    labels, component = np.unique(face_components, return_inverse=True)
+    near = np.zeros(len(component), dtype=bool)
+    if len(labels) > 128:
+        near[:] = True  # one pass per component would cost more than it saves
+        return near
+    for index in range(len(labels)):
+        members = component == index
+        low = bounds_min[members].min(axis=0)
+        high = bounds_max[members].max(axis=0)
+        gap = np.maximum(0.0, np.maximum(low - bounds_max, bounds_min - high))
+        near |= ~members & (np.einsum("ij,ij->i", gap, gap) < threshold_sq)
+    return near
 
 
 def build_virtual_edges(vertices, faces, radius):
@@ -318,6 +564,12 @@ def build_virtual_edges(vertices, faces, radius):
     virtual_edges = set()
     threshold_sq = (2.0 * radius) ** 2
 
+    scan = np.flatnonzero(near_other_component(
+        bounds_min, bounds_max, face_components, threshold_sq))
+    print(f"[virtual edges] {len(scan):,} faces lie near another component", flush=True)
+    if len(scan) == 0:
+        return virtual_edges
+
     if NUMBA_AVAILABLE:
         print(
             "[virtual edges] preparing Numba kernel (first run compiles)...", flush=True)
@@ -344,7 +596,7 @@ def build_virtual_edges(vertices, faces, radius):
                   flush=True)
             last_report = now
 
-    for i in range(len(faces)):
+    for i in scan.tolist():
         search_radius = 2.0 * radius + triangle_radii[i] + maximum_radius
         candidates = np.asarray(tree.query_ball_point(centroids[i], search_radius),
                                 dtype=np.int64)
@@ -447,34 +699,48 @@ def collapse_normal_diagnostics(vertices, local_faces, a, b, position):
     """
     flips = 0
     degeneracies = 0
-    for face in local_faces:
-        has_a = False
-        has_b = False
-        for v in face:
-            has_a = has_a or v == a
-            has_b = has_b or v == b
-        if has_a and has_b:
+    px, py, pz = position[0], position[1], position[2]
+    for index in range(len(local_faces)):
+        i, j, k = local_faces[index, 0], local_faces[index, 1], local_faces[index, 2]
+        move_i = i == a or i == b
+        move_j = j == a or j == b
+        move_k = k == a or k == b
+        if (i == a or j == a or k == a) and (i == b or j == b or k == b):
             continue
-        before = vertices[face].copy()
-        after = before.copy()
-        for i in range(3):
-            if face[i] == a or face[i] == b:
-                after[i] = position
-        old_normal = np.cross(before[1]-before[0], before[2]-before[0])
-        new_normal = np.cross(after[1]-after[0], after[2]-after[0])
-        old_sq = np.dot(old_normal, old_normal)
+        x0, y0, z0 = vertices[i, 0], vertices[i, 1], vertices[i, 2]
+        x1, y1, z1 = vertices[j, 0], vertices[j, 1], vertices[j, 2]
+        x2, y2, z2 = vertices[k, 0], vertices[k, 1], vertices[k, 2]
+        ux, uy, uz = x1 - x0, y1 - y0, z1 - z0
+        vx, vy, vz = x2 - x0, y2 - y0, z2 - z0
+        old_x, old_y, old_z = uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx
+        old_sq = old_x * old_x + old_y * old_y + old_z * old_z
         if old_sq == 0:
             continue
-        new_sq = np.dot(new_normal, new_normal)
-        if new_sq <= old_sq * 1e-24:
+        if move_i:
+            x0, y0, z0 = px, py, pz
+        if move_j:
+            x1, y1, z1 = px, py, pz
+        if move_k:
+            x2, y2, z2 = px, py, pz
+        ux, uy, uz = x1 - x0, y1 - y0, z1 - z0
+        vx, vy, vz = x2 - x0, y2 - y0, z2 - z0
+        new_x, new_y, new_z = uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx
+        if new_x * new_x + new_y * new_y + new_z * new_z <= old_sq * 1e-24:
             degeneracies += 1
-        elif np.dot(old_normal, new_normal) <= 0:
+        elif old_x * new_x + old_y * new_y + old_z * new_z <= 0:
             flips += 1
     return flips, degeneracies
 
 
 def simplify(vertices, faces, target_faces, virtual_radius, track_history, face_weights,
-             *, normal_guard=False, diagnostics=None):
+             *, normal_guard=False, diagnostics=None, reuse_costs=True):
+    """Collapse edges until target_faces remain.
+
+    reuse_costs=False recomputes the cost of every edge around a collapse, as
+    the audited reference loop does. The default keeps the cost of edges whose
+    inputs (endpoint quadrics, positions, boundary terms) did not change; both
+    produce the same collapse sequence.
+    """
 
     stats = dict(checked=0, rejected=0, accepted=0, accepted_flip_events=0,
                  accepted_degenerate_events=0)
@@ -487,32 +753,28 @@ def simplify(vertices, faces, target_faces, virtual_radius, track_history, face_
     vertex_edges = [set() for _ in range(len(vertices))]
     # Dictionary with edge tuple key and set of face indices as value
     edge_faces = defaultdict(set)
-    # Version dict for preventing using old versions from heap pop
+    # Version dict for preventing using old versions from heap pop.
+    # It changes when an edge is removed or gets a new cost.
     edge_version = defaultdict(int)
 
-    vertex_active = np.ones(len(vertices), dtype=bool)
-    face_active = np.ones(len(faces), dtype=bool)
+    # Plain lists: they are read several times per edge in the collapse loop.
+    vertex_active = [True] * len(vertices)
+    face_active = [True] * len(faces)
 
     init_started = time.perf_counter()
     print("[initialize] building mesh adjacency...", flush=True)
-    for f_idx, face in enumerate(faces):
+    for f_idx, (i, j, k) in enumerate(faces.tolist()):
         if f_idx and f_idx % 25000 == 0:
             print(f"[initialize] faces={f_idx:,}/{len(faces):,}, "
                   f"elapsed={time.perf_counter()-init_started:.1f}s", flush=True)
-
-        i, j, k = face
 
         vertex_faces[i].add(f_idx)
         vertex_faces[j].add(f_idx)
         vertex_faces[k].add(f_idx)
 
-        edges = [
-            tuple(sorted((i, j))),
-            tuple(sorted((j, k))),
-            tuple(sorted((k, i)))
-        ]
-
-        for edge in edges:
+        for edge in ((i, j) if i < j else (j, i),
+                     (j, k) if j < k else (k, j),
+                     (k, i) if k < i else (i, k)):
             a, b = edge
             vertex_edges[a].add(edge)
             vertex_edges[b].add(edge)
@@ -555,14 +817,25 @@ def simplify(vertices, faces, target_faces, virtual_radius, track_history, face_
 
     vertex_area = np.zeros_like(Q)
     boundary_quadrics = {}
+    # Vertices whose vertex_area currently holds boundary terms.
+    area_vertices = set()
 
     def refresh_area(vertex_ids):
-        # Rebuild current boundary contributions, never accumulate old area terms.
+        """Rebuild current boundary contributions, never accumulate old area terms.
+
+        Returns the vertices with a changed boundary term: a new area quadric,
+        or an incident edge whose boundary quadric appeared, moved or vanished.
+        """
+        changed = set()
         touched_edges = set()
         for v in vertex_ids:
             touched_edges.update(vertex_edges[v])
-        for e in sorted(touched_edges):
+        for e in touched_edges:
             if len(edge_faces[e]) == 1:
+                # A collapse drops the quadrics of every edge at the vertex it
+                # moves, so a quadric that is still here has unmoved endpoints.
+                if e in boundary_quadrics:
+                    continue
                 u, v = e
                 s = vertices[v] - vertices[u]
                 t = np.cross(vertices[u], vertices[v])
@@ -572,14 +845,26 @@ def simplify(vertices, faces, target_faces, virtual_radius, track_history, face_
                 q[:3, 3] = q[3, :3] = -0.5 * (S @ t)
                 q[3, 3] = 0.5 * np.dot(t, t)
                 boundary_quadrics[e] = q
-            else:
-                boundary_quadrics.pop(e, None)
+                changed.update(e)
+            elif boundary_quadrics.pop(e, None) is not None:
+                changed.update(e)
+        if not boundary_quadrics and not area_vertices:
+            return changed  # closed surface: all terms are zero
         for v in vertex_ids:
-            vertex_area[v].fill(0.0)
-            for e in sorted(vertex_edges[v]):
-                q = boundary_quadrics.get(e)
-                if q is not None:
-                    vertex_area[v] += q
+            terms = [e for e in vertex_edges[v] if e in boundary_quadrics]
+            if not terms and v not in area_vertices:
+                continue
+            total = np.zeros((4, 4), dtype=np.float64)
+            for e in sorted(terms):
+                total += boundary_quadrics[e]
+            if not np.array_equal(total, vertex_area[v]):
+                vertex_area[v] = total
+                changed.add(v)
+            if terms:
+                area_vertices.add(v)
+            else:
+                area_vertices.discard(v)
+        return changed
 
     refresh_area(range(len(vertices)))
     area_cache = (vertex_area, boundary_quadrics)
@@ -593,31 +878,41 @@ def simplify(vertices, faces, target_faces, virtual_radius, track_history, face_
     # Min heap tie-breaker counter
     counter = 0
 
+    # Current (cost, position) of every edge, valid while its inputs are unchanged.
+    edge_cost = {}
+    # Tie-breaker each queued edge has in the reference loop, which pushes every
+    # edge around a collapse again. An edge that keeps its cost only gets its
+    # number updated here; its heap entry moves when it reaches the top.
+    edge_order = {}
+
     print(f"[heap] initializing {len(edge_faces):,} edge costs", flush=True)
-    for edge_index, edge in enumerate(sorted(edge_faces)):
-        if edge_index and edge_index % 25000 == 0:
+    initial_edges = sorted(edge_faces)
+    for begin in range(0, len(initial_edges), 25000):
+        if begin:
             print(
-                f"[heap] costs={edge_index:,}/{len(edge_faces):,}", flush=True)
-        cost, position = compute_edge_cost(
-            edge,
+                f"[heap] costs={begin:,}/{len(edge_faces):,}", flush=True)
+        chunk = initial_edges[begin:begin + 25000]
+        costs, positions = compute_edge_costs(
+            chunk,
             vertices,
             Q,
             vertex_edges,
             edge_faces,
             area_cache
         )
-
-        version = edge_version[edge]
-
-        heap.append((cost, counter, edge, position, version))
-        counter += 1
+        for edge, cost, position in zip(chunk, costs.tolist(), positions):
+            edge_cost[edge] = (cost, position)
+            edge_order[edge] = counter
+            heap.append((cost, counter, edge, position, edge_version[edge]))
+            counter += 1
+    del initial_edges
 
     heapq.heapify(heap)
     active_face_count = len(faces)
     history = []
 
     while active_face_count > target_faces and heap:
-        cost, _, edge, position, version = heapq.heappop(heap)
+        cost, order, edge, position, version = heapq.heappop(heap)
         a, b = edge
 
         if not vertex_active[a] or not vertex_active[b]:
@@ -629,63 +924,58 @@ def simplify(vertices, faces, target_faces, virtual_radius, track_history, face_
         # Skip if the version is old
         if version != edge_version[edge]:
             continue
+        # Requeued since this entry was pushed: it belongs further back.
+        if order != edge_order[edge]:
+            heapq.heappush(heap, (cost, edge_order[edge], edge, position, version))
+            continue
 
-        old_face_ids = {
+        old_face_ids = sorted(
             fi for fi in (vertex_faces[a] | vertex_faces[b])
             if face_active[fi]
-        }
+        )
+        pre_face_ids = np.array(old_face_ids, dtype=np.int64)
+        pre_faces = faces[pre_face_ids]
         if normal_guard or diagnostics is not None:
             flip_count, degenerate_count = collapse_normal_diagnostics(
-                vertices, faces[np.array(sorted(old_face_ids), dtype=np.int64)], a, b, position)
+                vertices, pre_faces, a, b, position)
             stats['checked'] += 1
             if normal_guard and (flip_count or degenerate_count):
                 # Neighboring collapses invalidate/requeue this edge normally.
                 stats['rejected'] += 1
+                del edge_order[edge]
                 continue
             stats['accepted'] += 1
             stats['accepted_flip_events'] += int(flip_count)
             stats['accepted_degenerate_events'] += int(degenerate_count)
-        old_edges = set(vertex_edges[a]) | set(vertex_edges[b])
+        old_edges = vertex_edges[a] | vertex_edges[b]
         affected_vertices = {a, b}
+        # Vertex ids of the old faces; updated in place as the faces change.
+        face_rows = pre_faces.tolist()
 
-        for fi in sorted(old_face_ids):
-            affected_vertices.update(int(v) for v in faces[fi])
+        for row in face_rows:
+            affected_vertices.update(row)
 
-        for e in sorted(old_edges):
+        for e in old_edges:
             affected_vertices.update(e)
 
         if track_history:
-            pre_face_ids = np.array(
-                sorted(old_face_ids),
-                dtype=np.int64
-            )
-            if len(pre_face_ids) > 0:
-                pre_triangles = vertices[faces[pre_face_ids]].astype(
-                    np.float32,
-                    copy=True
-                )
-            else:
-                pre_triangles = np.empty((0, 3, 3), dtype=np.float32)
+            pre_triangles = vertices[pre_faces].astype(np.float32)
 
-        for fi in sorted(old_face_ids):
-            face = faces[fi]
+        for fi, (i, j, k) in zip(old_face_ids, face_rows):
+            vertex_faces[i].discard(fi)
+            vertex_faces[j].discard(fi)
+            vertex_faces[k].discard(fi)
 
-            for v in face:
-                vertex_faces[v].discard(fi)
-
-            i, j, k = face
-            local_edges = [
-                tuple(sorted((i, j))),
-                tuple(sorted((j, k))),
-                tuple(sorted((k, i))),
-            ]
-
-            for e in local_edges:
+            for e in ((i, j) if i < j else (j, i),
+                      (j, k) if j < k else (k, j),
+                      (k, i) if k < i else (i, k)):
                 if e in edge_faces:
                     edge_faces[e].discard(fi)
 
-        for e in sorted(old_edges):
+        for e in old_edges:
             boundary_quadrics.pop(e, None)
+            edge_cost.pop(e, None)
+            edge_order.pop(e, None)
             edge_version[e] += 1
 
             if e in edge_faces:
@@ -699,66 +989,43 @@ def simplify(vertices, faces, target_faces, virtual_radius, track_history, face_
         Q[a] += Q[b]
         vertex_active[b] = False
 
-        # Used list to copy face indices, since it could be modified
-        # throughout the for loop
-        for fi in list(old_face_ids):
-            if not face_active[fi]:
-                continue
+        unique_faces = set()
+        surviving = []
 
-            face = faces[fi].copy()
-
+        for fi, row in zip(old_face_ids, face_rows):
             # (a,b,c) -> (a,a,c) degenerate face
-            if a in face and b in face:
+            if a in row and b in row:
                 face_active[fi] = False
                 active_face_count -= 1
                 continue
 
             # b -> a
-            faces[fi][faces[fi] == b] = a
+            if b in row:
+                row[:] = [a if v == b else v for v in row]
+                faces[fi] = row
 
-            if len(set(int(v) for v in faces[fi])) < 3:
-                face_active[fi] = False
-                active_face_count -= 1
-
-        unique_faces = {}
-
-        for fi in sorted(old_face_ids):
-            if not face_active[fi]:
-                continue
-
-            key = tuple(sorted(int(v) for v in faces[fi]))
-
-            if key in unique_faces:
+            key = tuple(sorted(row))
+            if key[0] == key[1] or key[1] == key[2] or key in unique_faces:
                 face_active[fi] = False
                 active_face_count -= 1
             else:
-                unique_faces[key] = fi
+                unique_faces.add(key)
+                surviving.append((fi, row))
 
-        for fi in sorted(old_face_ids):
-            if not face_active[fi]:
-                continue
-
-            i, j, k = faces[fi]
-
+        for fi, (i, j, k) in surviving:
             vertex_faces[i].add(fi)
             vertex_faces[j].add(fi)
             vertex_faces[k].add(fi)
 
-            new_edges = [
-                tuple(sorted((i, j))),
-                tuple(sorted((j, k))),
-                tuple(sorted((k, i))),
-            ]
-
-            for e in new_edges:
+            for e in ((i, j) if i < j else (j, i),
+                      (j, k) if j < k else (k, j),
+                      (k, i) if k < i else (i, k)):
                 u, v = e
                 edge_faces[e].add(fi)
                 vertex_edges[u].add(e)
                 vertex_edges[v].add(e)
 
-        for old_edge in sorted(old_edges):
-            u, v = old_edge
-
+        for u, v in old_edges:
             if u == b:
                 u = a
             if v == b:
@@ -766,11 +1033,10 @@ def simplify(vertices, faces, target_faces, virtual_radius, track_history, face_
             if u == v:
                 continue
 
-            new_edge = tuple(sorted((u, v)))
-            x, y = new_edge
+            new_edge = (u, v) if u < v else (v, u)
             edge_faces[new_edge]
-            vertex_edges[x].add(new_edge)
-            vertex_edges[y].add(new_edge)
+            vertex_edges[u].add(new_edge)
+            vertex_edges[v].add(new_edge)
 
         vertex_faces[b].clear()
         vertex_edges[b].clear()
@@ -782,15 +1048,15 @@ def simplify(vertices, faces, target_faces, virtual_radius, track_history, face_
                 np.array(sorted(vertex_faces[a]), dtype=np.int64)
             ))
 
-        refresh_area(affected_vertices)
+        changed_vertices = refresh_area(affected_vertices)
         affected_edges = set()
 
         for v in affected_vertices:
-            if v < 0 or v >= len(vertices):
-                continue
-            if not vertex_active[v]:
-                continue
-            affected_edges.update(vertex_edges[v])
+            if vertex_active[v]:
+                affected_edges.update(vertex_edges[v])
+
+        requeued = []
+        stale = []
 
         for new_edge in sorted(affected_edges):
             u, v = new_edge
@@ -800,36 +1066,50 @@ def simplify(vertices, faces, target_faces, virtual_radius, track_history, face_
             if new_edge not in edge_faces:
                 continue
 
-            new_cost, new_position = compute_edge_cost(
-                new_edge,
+            requeued.append(new_edge)
+            # Edges at the collapsed vertex are new and have no stored cost.
+            if (not reuse_costs or new_edge not in edge_cost
+                    or u in changed_vertices or v in changed_vertices):
+                stale.append(new_edge)
+
+        if stale:
+            costs, positions = compute_edge_costs(
+                stale,
                 vertices,
                 Q,
                 vertex_edges,
                 edge_faces,
                 area_cache
             )
+            for new_edge, new_cost, new_position in zip(stale, costs.tolist(), positions):
+                edge_cost[new_edge] = (new_cost, new_position)
+                edge_version[new_edge] += 1
+                # The entry with the old cost is void; a new one is pushed below.
+                edge_order.pop(new_edge, None)
 
-            edge_version[new_edge] += 1
-            new_version = edge_version[new_edge]
-
-            heapq.heappush(
-                heap,
-                (
-                    new_cost,
-                    counter,
-                    new_edge,
-                    new_position,
-                    new_version
+        for new_edge in requeued:
+            if new_edge not in edge_order:
+                new_cost, new_position = edge_cost[new_edge]
+                heapq.heappush(
+                    heap,
+                    (
+                        new_cost,
+                        counter,
+                        new_edge,
+                        new_position,
+                        edge_version[new_edge]
+                    )
                 )
-            )
+            edge_order[new_edge] = counter
             counter += 1
 
         collapse_count += 1
         # Lazy invalidation needs bounded storage on large meshes.
         if len(heap) > max(10000, 4 * len(edge_faces)):
+            # Most stale entries fail the version test, so it goes first.
             heap = [item for item in heap
-                    if item[2] in edge_faces
-                    and item[4] == edge_version[item[2]]
+                    if item[4] == edge_version[item[2]]
+                    and item[2] in edge_faces
                     and vertex_active[item[2][0]] and vertex_active[item[2][1]]]
             heapq.heapify(heap)
         if collapse_count % 1000 == 0:
@@ -839,7 +1119,7 @@ def simplify(vertices, faces, target_faces, virtual_radius, track_history, face_
                       f"collapses={collapse_count:,} elapsed={now-started:.1f}s", flush=True)
                 last_report = now
 
-    active_vertex_indices = np.where(vertex_active)[0]
+    active_vertex_indices = np.flatnonzero(vertex_active)
 
     old_to_new = -np.ones(len(vertices), dtype=np.int64)
     old_to_new[active_vertex_indices] = np.arange(
@@ -848,7 +1128,7 @@ def simplify(vertices, faces, target_faces, virtual_radius, track_history, face_
 
     new_vertices = vertices[active_vertex_indices]
 
-    active_face_indices = np.where(face_active)[0]
+    active_face_indices = np.flatnonzero(face_active)
     new_faces = old_to_new[faces[active_face_indices]]
 
     if diagnostics is not None:
@@ -869,144 +1149,6 @@ def cross_matrix(v):
     ], dtype=np.float64)
 
     return matrix
-
-
-def closest_point_on_triangle(point, a, b, c):
-    ab = b - a
-    ac = c - a
-    ap = point - a
-
-    # -------------------------------------------------
-    # Degenerate triangle guard
-    # -------------------------------------------------
-    normal = np.cross(ab, ac)
-
-    if np.dot(normal, normal) < 1e-20:
-        # Triangle이 거의 선/점이면
-        # 세 edge 중 가장 가까운 점을 사용
-        best_point = a.copy()
-        best_bary = np.array([1.0, 0.0, 0.0])
-        best_dist = np.dot(point - a, point - a)
-
-        # AB
-        ab_len2 = np.dot(ab, ab)
-        if ab_len2 > 1e-20:
-            t = np.dot(point - a, ab) / ab_len2
-            t = min(max(t, 0.0), 1.0)
-
-            candidate = a + t * ab
-            diff = point - candidate
-            dist = np.dot(diff, diff)
-
-            if dist < best_dist:
-                best_dist = dist
-                best_point = candidate
-                best_bary = np.array([1.0 - t, t, 0.0])
-
-        # AC
-        ac_len2 = np.dot(ac, ac)
-        if ac_len2 > 1e-20:
-            t = np.dot(point - a, ac) / ac_len2
-            t = min(max(t, 0.0), 1.0)
-
-            candidate = a + t * ac
-            diff = point - candidate
-            dist = np.dot(diff, diff)
-
-            if dist < best_dist:
-                best_dist = dist
-                best_point = candidate
-                best_bary = np.array([1.0 - t, 0.0, t])
-
-        # BC
-        bc = c - b
-        bc_len2 = np.dot(bc, bc)
-
-        if bc_len2 > 1e-20:
-            t = np.dot(point - b, bc) / bc_len2
-            t = min(max(t, 0.0), 1.0)
-
-            candidate = b + t * bc
-            diff = point - candidate
-            dist = np.dot(diff, diff)
-
-            if dist < best_dist:
-                best_point = candidate
-                best_bary = np.array([0.0, 1.0 - t, t])
-
-        return best_point, best_bary
-
-    # -------------------------------------------------
-    # Original closest-point algorithm
-    # -------------------------------------------------
-    d1 = np.dot(ab, ap)
-    d2 = np.dot(ac, ap)
-
-    if d1 <= 0.0 and d2 <= 0.0:
-        return a.copy(), np.array([1.0, 0.0, 0.0])
-
-    bp = point - b
-    d3 = np.dot(ab, bp)
-    d4 = np.dot(ac, bp)
-
-    if d3 >= 0.0 and d4 <= d3:
-        return b.copy(), np.array([0.0, 1.0, 0.0])
-
-    vc = d1 * d4 - d3 * d2
-
-    if vc <= 0.0 and d1 >= 0.0 and d3 <= 0.0:
-        v = d1 / (d1 - d3)
-        return a + v * ab, np.array([1.0 - v, v, 0.0])
-
-    cp = point - c
-    d5 = np.dot(ab, cp)
-    d6 = np.dot(ac, cp)
-
-    if d6 >= 0.0 and d5 <= d6:
-        return c.copy(), np.array([0.0, 0.0, 1.0])
-
-    vb = d5 * d2 - d1 * d6
-
-    if vb <= 0.0 and d2 >= 0.0 and d6 <= 0.0:
-        w = d2 / (d2 - d6)
-        return a + w * ac, np.array([1.0 - w, 0.0, w])
-
-    va = d3 * d6 - d5 * d4
-
-    if va <= 0.0 and (d4 - d3) >= 0.0 and (d5 - d6) >= 0.0:
-        bc = c - b
-        w = (d4 - d3) / ((d4 - d3) + (d5 - d6))
-        return b + w * bc, np.array([0.0, 1.0 - w, w])
-
-    denom = va + vb + vc
-
-    if abs(denom) < 1e-15:
-        distances = np.array([
-            np.dot(point - a, point - a),
-            np.dot(point - b, point - b),
-            np.dot(point - c, point - c)
-        ])
-
-        index = int(np.argmin(distances))
-        bary = np.zeros(3, dtype=np.float64)
-        bary[index] = 1.0
-
-        if index == 0:
-            return a.copy(), bary
-        elif index == 1:
-            return b.copy(), bary
-        else:
-            return c.copy(), bary
-
-    inv_denom = 1.0 / denom
-
-    v = vb * inv_denom
-    w = vc * inv_denom
-    u = 1.0 - v - w
-
-    closest = u * a + v * b + w * c
-
-    return closest, np.array([u, v, w])
 
 
 def build_grid_atlas_samples(vertices, faces, active_face_indices, texture_size):
@@ -1070,14 +1212,15 @@ def barycentric_2d(points_uv, triangle_uv):
     v0 = b - a
     v1 = c - a
     v2 = points_uv - a
-    d00 = np.dot(v0, v0)
-    d01 = np.dot(v0, v1)
-    d11 = np.dot(v1, v1)
+    # Written out (no BLAS) so rasterize_uv_triangles computes the same bits.
+    d00 = v0[0] * v0[0] + v0[1] * v0[1]
+    d01 = v0[0] * v1[0] + v0[1] * v1[1]
+    d11 = v1[0] * v1[0] + v1[1] * v1[1]
     denom = d00 * d11 - d01 * d01
     if abs(denom) < 1e-20:
         return np.empty((0, 3), dtype=np.float64)
-    d20 = v2 @ v0
-    d21 = v2 @ v1
+    d20 = v2[:, 0] * v0[0] + v2[:, 1] * v0[1]
+    d21 = v2[:, 0] * v1[0] + v2[:, 1] * v1[1]
     beta = (d11 * d20 - d01 * d21) / denom
     gamma = (d00 * d21 - d01 * d20) / denom
     alpha = 1.0 - beta - gamma
@@ -1142,6 +1285,118 @@ def rasterize_uv_triangle(triangle_uv, texture_size, supersample=1):
     return yy.ravel()[inside], xx.ravel()[inside], bary[inside]
 
 
+def rasterize_uv_triangles(triangle_uvs, corners, texture_size, supersample,
+                           pixels, barycentrics, points):
+    """rasterize_uv_triangle for every triangle in one compiled loop.
+
+    Returns the sample count per triangle. Samples are written in triangle
+    order while they fit, so the caller runs it once with empty outputs to
+    size them and once more to fill them. corners holds the 3D triangle
+    corners; points receives the 3D position of every sample.
+    """
+    counts = np.zeros(len(triangle_uvs), dtype=np.int64)
+    capacity = len(pixels)
+    reach = 0.5 if supersample == 1 else 1.0
+    eps = 1e-8
+    total = 0
+    for face in range(len(triangle_uvs)):
+        au, av = triangle_uvs[face, 0, 0], triangle_uvs[face, 0, 1]
+        bu, bv = triangle_uvs[face, 1, 0], triangle_uvs[face, 1, 1]
+        cu, cv = triangle_uvs[face, 2, 0], triangle_uvs[face, 2, 1]
+        u_min = max(0.0, min(au, bu, cu))
+        u_max = min(1.0, max(au, bu, cu))
+        v_min = max(0.0, min(av, bv, cv))
+        v_max = min(1.0, max(av, bv, cv))
+        x0 = max(0, int(np.floor(u_min * texture_size - reach)))
+        x1 = min(texture_size - 1, int(np.ceil(u_max * texture_size - 1.0 + reach)))
+        y0 = max(0, int(np.floor((1.0 - v_max) * texture_size - reach)))
+        y1 = min(texture_size - 1, int(np.ceil((1.0 - v_min) * texture_size - 1.0 + reach)))
+        v0u, v0v = bu - au, bv - av
+        v1u, v1v = cu - au, cv - av
+        d00 = v0u * v0u + v0v * v0v
+        d01 = v0u * v1u + v0v * v1v
+        d11 = v1u * v1u + v1v * v1v
+        denom = d00 * d11 - d01 * d01
+        if abs(denom) < 1e-20:
+            continue
+        for y in range(y0, y1 + 1):
+            for x in range(x0, x1 + 1):
+                for sub_y in range(supersample):
+                    for sub_x in range(supersample):
+                        if supersample == 1:
+                            su = (x + 0.5) / texture_size
+                            sv = 1.0 - (y + 0.5) / texture_size
+                        else:
+                            su = (x + (sub_x + 0.5) / supersample) / texture_size
+                            sv = 1.0 - (y + (sub_y + 0.5) / supersample) / texture_size
+                        v2u, v2v = su - au, sv - av
+                        d20 = v2u * v0u + v2v * v0v
+                        d21 = v2u * v1u + v2v * v1v
+                        beta = (d11 * d20 - d01 * d21) / denom
+                        gamma = (d00 * d21 - d01 * d20) / denom
+                        alpha = 1.0 - beta - gamma
+                        if not (alpha >= -eps and beta >= -eps and gamma >= -eps
+                                and alpha <= 1.0 + eps and beta <= 1.0 + eps
+                                and gamma <= 1.0 + eps):
+                            continue
+                        if total < capacity:
+                            pixels[total, 0] = y
+                            pixels[total, 1] = x
+                            barycentrics[total, 0] = alpha
+                            barycentrics[total, 1] = beta
+                            barycentrics[total, 2] = gamma
+                            for axis in range(3):
+                                points[total, axis] = (alpha * corners[face, 0, axis]
+                                                       + beta * corners[face, 1, axis]
+                                                       + gamma * corners[face, 2, axis])
+                        total += 1
+                        counts[face] += 1
+    return counts
+
+
+def match_atlas_faces(faces, vmapping, atlas_indices):
+    """UV vertex index of every corner of every input face.
+
+    xatlas normally returns the triangles in input order with the corners
+    unchanged; then the atlas indices are the answer. Otherwise (or when two
+    faces share a vertex set, where the pairing below is order dependent) the
+    triangles are matched one by one through their vertex ids.
+    """
+    ordered = np.sort(faces, axis=1)
+    if (np.array_equal(vmapping[atlas_indices], faces)
+            and np.all(ordered[:, 0] != ordered[:, 1]) and np.all(ordered[:, 1] != ordered[:, 2])
+            and len(np.unique(ordered, axis=0)) == len(faces)):
+        return atlas_indices.copy()
+
+    # Match xatlas output triangles back to the simplified input face IDs.
+    # This avoids relying on xatlas preserving face order.
+    face_lookup = defaultdict(list)
+    for fi, face in enumerate(faces):
+        face_lookup[tuple(sorted(int(v) for v in face))].append(fi)
+
+    face_uv_indices = np.empty((len(faces), 3), dtype=np.int64)
+
+    for atlas_fi, uv_face in enumerate(atlas_indices):
+        geom_face = vmapping[uv_face]
+        key = tuple(sorted(int(v) for v in geom_face))
+        candidates = face_lookup.get(key)
+        if not candidates:
+            raise RuntimeError(
+                "Could not map an xatlas triangle back to the simplified mesh."
+            )
+        source_fi = candidates.pop()
+        source_face = faces[source_fi]
+
+        for source_corner, vertex_id in enumerate(source_face):
+            matches = np.where(geom_face == int(vertex_id))[0]
+            if len(matches) != 1:
+                raise RuntimeError(
+                    "Ambiguous xatlas corner mapping encountered.")
+            face_uv_indices[source_fi, source_corner] = int(uv_face[int(matches[0])])
+
+    return face_uv_indices
+
+
 def build_xatlas_samples(vertices, faces, active_face_indices, texture_size, padding, supersample=1):
     """Create a charted UV atlas with xatlas and rasterize its texels.
 
@@ -1188,35 +1443,8 @@ def build_xatlas_samples(vertices, faces, active_face_indices, texture_size, pad
             f"xatlas returned {len(atlas_indices)} triangles for {len(faces)} input triangles."
         )
 
-    # Match xatlas output triangles back to the simplified input face IDs.
-    # This avoids relying on xatlas preserving face order.
-    face_lookup = defaultdict(list)
-    for fi, face in enumerate(faces):
-        face_lookup[tuple(sorted(int(v) for v in face))].append(fi)
-
-    triangle_uvs = np.empty((len(faces), 3, 2), dtype=np.float64)
-    face_uv_indices = np.empty((len(faces), 3), dtype=np.int64)
-
-    for atlas_fi, uv_face in enumerate(atlas_indices):
-        geom_face = vmapping[uv_face]
-        key = tuple(sorted(int(v) for v in geom_face))
-        candidates = face_lookup.get(key)
-        if not candidates:
-            raise RuntimeError(
-                "Could not map an xatlas triangle back to the simplified mesh."
-            )
-        source_fi = candidates.pop()
-        source_face = faces[source_fi]
-
-        for source_corner, vertex_id in enumerate(source_face):
-            matches = np.where(geom_face == int(vertex_id))[0]
-            if len(matches) != 1:
-                raise RuntimeError(
-                    "Ambiguous xatlas corner mapping encountered.")
-            atlas_corner = int(matches[0])
-            uv_index = int(uv_face[atlas_corner])
-            face_uv_indices[source_fi, source_corner] = uv_index
-            triangle_uvs[source_fi, source_corner] = uv_vertices[uv_index]
+    face_uv_indices = match_atlas_faces(faces, vmapping, atlas_indices)
+    triangle_uvs = uv_vertices[face_uv_indices]
 
     if not np.all(np.isfinite(triangle_uvs)):
         raise RuntimeError("xatlas produced non-finite UV coordinates.")
@@ -1227,41 +1455,53 @@ def build_xatlas_samples(vertices, faces, active_face_indices, texture_size, pad
         uv_vertices = uv_vertices / float(texture_size)
         triangle_uvs = triangle_uvs / float(texture_size)
 
-    point_parts = []
-    bary_parts = []
-    face_id_parts = []
-    pixel_parts = []
-    valid_mask = np.zeros((texture_size, texture_size), dtype=bool)
-
     print(
         f"[atlas:xatlas] rasterizing {len(faces):,} UV triangles...", flush=True)
-    total_samples = 0
-    for fi, triangle_uv in enumerate(triangle_uvs):
-        rows, cols, bary = rasterize_uv_triangle(triangle_uv, texture_size, supersample)
-        if len(rows) == 0:
-            continue
+    corners = np.ascontiguousarray(vertices[faces], dtype=np.float64)
+    pixels = np.empty((0, 2), dtype=np.int32)
+    barycentrics = points = np.empty((0, 3), dtype=np.float64)
+    if NUMBA_AVAILABLE:
+        triangle_uvs = np.ascontiguousarray(triangle_uvs)
+        # Counting pass with empty outputs, then the pass that fills them.
+        counts = rasterize_uv_triangles(triangle_uvs, corners, texture_size, supersample,
+                                        pixels, barycentrics, points)
+        pixels = np.empty((int(counts.sum()), 2), dtype=np.int32)
+        barycentrics = np.empty((len(pixels), 3), dtype=np.float64)
+        points = np.empty((len(pixels), 3), dtype=np.float64)
+        rasterize_uv_triangles(triangle_uvs, corners, texture_size, supersample,
+                               pixels, barycentrics, points)
+    else:
+        point_parts = []
+        bary_parts = []
+        pixel_parts = []
+        counts = np.zeros(len(faces), dtype=np.int64)
+        for fi, triangle_uv in enumerate(triangle_uvs):
+            rows, cols, bary = rasterize_uv_triangle(triangle_uv, texture_size, supersample)
+            counts[fi] = len(rows)
+            if len(rows) == 0:
+                continue
 
-        points = bary @ vertices[faces[fi]]
-        point_parts.append(points.astype(np.float64, copy=False))
-        bary_parts.append(bary.astype(np.float64, copy=False))
-        face_id_parts.append(
-            np.full(len(rows), active_face_indices[fi], dtype=np.int64))
-        pixel_parts.append(np.column_stack(
-            (rows, cols)).astype(np.int32, copy=False))
-        valid_mask[rows, cols] = True
-        total_samples += len(rows)
+            point_parts.append(bary[:, 0:1] * corners[fi, 0] + bary[:, 1:2] * corners[fi, 1]
+                               + bary[:, 2:3] * corners[fi, 2])
+            bary_parts.append(bary)
+            pixel_parts.append(np.column_stack(
+                (rows, cols)).astype(np.int32, copy=False))
 
-        if fi and fi % 5000 == 0:
-            print(f"[atlas:xatlas] faces={fi:,}/{len(faces):,}, "
-                  f"samples={total_samples:,}", flush=True)
+            if fi and fi % 5000 == 0:
+                print(f"[atlas:xatlas] faces={fi:,}/{len(faces):,}, "
+                      f"samples={int(counts.sum()):,}", flush=True)
 
-    if not point_parts:
+        if point_parts:
+            points = np.concatenate(point_parts, axis=0)
+            barycentrics = np.concatenate(bary_parts, axis=0)
+            pixels = np.concatenate(pixel_parts, axis=0)
+
+    if len(pixels) == 0:
         raise RuntimeError("xatlas rasterization produced no texture samples.")
 
-    points = np.concatenate(point_parts, axis=0)
-    barycentrics = np.concatenate(bary_parts, axis=0)
-    face_ids = np.concatenate(face_id_parts, axis=0)
-    pixels = np.concatenate(pixel_parts, axis=0)
+    face_ids = np.repeat(np.asarray(active_face_indices, dtype=np.int64), counts)
+    valid_mask = np.zeros((texture_size, texture_size), dtype=bool)
+    valid_mask[pixels[:, 0], pixels[:, 1]] = True
 
     print(f"[atlas:xatlas] {texture_size}x{texture_size}, "
           f"uv_vertices={len(uv_vertices):,}, samples={len(points):,}", flush=True)
@@ -1281,36 +1521,98 @@ def build_xatlas_samples(vertices, faces, active_face_indices, texture_size, pad
     }
 
 
-def project_samples(points, triangles):
-    selected = np.empty(len(points), dtype=np.int64)
-    barycentrics = np.empty((len(points), 3), dtype=np.float64)
-    for i in range(len(points)):
-        best_distance = np.inf
-        for j in range(len(triangles)):
-            closest, bary = closest_point_on_triangle(
-                points[i], triangles[j, 0], triangles[j, 1], triangles[j, 2])
-            delta = points[i] - closest
-            distance = np.dot(delta, delta)
-            if distance < best_distance:
-                best_distance = distance
-                selected[i] = j
-                barycentrics[i] = bary
-    return selected, barycentrics
+def trace_history(points, faces, barycentrics, pre_start, pre_faces, pre_triangles,
+                  post_start, post_faces, head, link):
+    """Compiled loop of successive_map; updates faces and barycentrics in place.
+
+    head[face] and link[sample] are linked lists of the samples on each face.
+    Step i of the history owns pre_faces[pre_start[i]:pre_start[i + 1]] (with
+    their triangles) and post_faces[post_start[i]:post_start[i + 1]].
+    """
+    for sample in range(len(points)):
+        face = faces[sample]
+        link[sample] = head[face]
+        head[face] = sample
+
+    for step in range(len(pre_start) - 2, -1, -1):
+        chain = -1
+        for index in range(post_start[step], post_start[step + 1]):
+            face = post_faces[index]
+            sample = head[face]
+            head[face] = -1
+            while sample >= 0:
+                following = link[sample]
+                link[sample] = chain
+                chain = sample
+                sample = following
+
+        first, last = pre_start[step], pre_start[step + 1]
+        if first == last:
+            continue
+
+        while chain >= 0:
+            sample = chain
+            chain = link[sample]
+            px, py, pz = points[sample, 0], points[sample, 1], points[sample, 2]
+            best_distance = np.inf
+            for index in range(first, last):
+                distance, u, v, w = closest_point_barycentric(
+                    px, py, pz,
+                    np.float64(pre_triangles[index, 0, 0]),
+                    np.float64(pre_triangles[index, 0, 1]),
+                    np.float64(pre_triangles[index, 0, 2]),
+                    np.float64(pre_triangles[index, 1, 0]),
+                    np.float64(pre_triangles[index, 1, 1]),
+                    np.float64(pre_triangles[index, 1, 2]),
+                    np.float64(pre_triangles[index, 2, 0]),
+                    np.float64(pre_triangles[index, 2, 1]),
+                    np.float64(pre_triangles[index, 2, 2]))
+                if distance < best_distance:
+                    best_distance = distance
+                    faces[sample] = pre_faces[index]
+                    barycentrics[sample, 0] = u
+                    barycentrics[sample, 1] = v
+                    barycentrics[sample, 2] = w
+            face = faces[sample]
+            link[sample] = head[face]
+            head[face] = sample
 
 
 def successive_map(points, barycentrics, face_ids, history):
-    current_faces = face_ids.copy()
-    current_barycentrics = barycentrics.copy()
+    current_faces = face_ids.astype(np.int64)
+    current_barycentrics = barycentrics.astype(np.float64)
+
+    if not history or len(points) == 0:
+        return current_faces, current_barycentrics
+
+    if NUMBA_AVAILABLE:
+        pre_start = np.zeros(len(history) + 1, dtype=np.int64)
+        post_start = np.zeros(len(history) + 1, dtype=np.int64)
+        np.cumsum([len(step[0]) for step in history], out=pre_start[1:])
+        np.cumsum([len(step[2]) for step in history], out=post_start[1:])
+        pre_faces = np.concatenate([step[0] for step in history]).astype(np.int64, copy=False)
+        post_faces = np.concatenate([step[2] for step in history]).astype(np.int64, copy=False)
+        pre_triangles = np.concatenate([step[1] for step in history])
+        face_count = 1 + max(int(current_faces.max()), int(pre_faces.max(initial=0)),
+                             int(post_faces.max(initial=0)))
+        trace_history(
+            np.ascontiguousarray(points, dtype=np.float64), current_faces,
+            current_barycentrics, pre_start, pre_faces, pre_triangles,
+            post_start, post_faces, np.full(face_count, -1, dtype=np.int64),
+            np.empty(len(points), dtype=np.int64))
+        return current_faces, current_barycentrics
+
+    # NumPy fallback: the same walk, one vectorized projection per history step.
     face_samples = defaultdict(list)
 
-    for sample_index, face_id in enumerate(current_faces):
-        face_samples[int(face_id)].append(sample_index)
+    for sample_index, face_id in enumerate(current_faces.tolist()):
+        face_samples[face_id].append(sample_index)
 
     for pre_face_ids, pre_triangles, post_face_ids in reversed(history):
         affected_samples = []
 
-        for face_id in post_face_ids:
-            sample_indices = face_samples.pop(int(face_id), None)
+        for face_id in post_face_ids.tolist():
+            sample_indices = face_samples.pop(face_id, None)
 
             if sample_indices:
                 affected_samples.extend(sample_indices)
@@ -1318,19 +1620,16 @@ def successive_map(points, barycentrics, face_ids, history):
         if not affected_samples or len(pre_face_ids) == 0:
             continue
 
-        reassigned = defaultdict(list)
-
         sample_indices = np.asarray(affected_samples, dtype=np.int64)
-        selected, bary = project_samples(
+        distances, bary = closest_points_barycentric(
             points[sample_indices], pre_triangles.astype(np.float64))
+        # First strictly smaller distance wins, as in trace_history.
+        selected = np.argmin(np.where(distances < np.inf, distances, np.inf), axis=1)
         chosen_faces = pre_face_ids[selected]
         current_faces[sample_indices] = chosen_faces
-        current_barycentrics[sample_indices] = bary
-        for sample_index, best_face in zip(sample_indices, chosen_faces):
-            reassigned[int(best_face)].append(int(sample_index))
-
-        for face_id, sample_indices in reassigned.items():
-            face_samples[face_id].extend(sample_indices)
+        current_barycentrics[sample_indices] = bary[np.arange(len(selected)), selected]
+        for sample_index, best_face in zip(affected_samples, chosen_faces.tolist()):
+            face_samples[best_face].append(sample_index)
 
     return current_faces, current_barycentrics
 
@@ -1559,10 +1858,11 @@ except ImportError:
     NUMBA_AVAILABLE = False
 else:
     NUMBA_AVAILABLE = True
-    for _name in ("closest_point_on_triangle", "point_triangle_distance_sq",
+    for _name in ("closest_point_barycentric", "point_triangle_distance_sq",
                   "segment_segment_distance_sq", "segment_intersects_triangle",
                   "triangle_triangle_distance_sq", "closest_vertex_pair",
-                  "virtual_edge_batch", "project_samples", "collapse_normal_diagnostics"):
+                  "virtual_edge_batch", "trace_history", "collapse_normal_diagnostics",
+                  "rasterize_uv_triangles"):
         globals()[_name] = njit(cache=True)(globals()[_name])
 
 
